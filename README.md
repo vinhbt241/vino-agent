@@ -11,9 +11,13 @@ This guide covers spinning up the server with a proper config.
 
 ```bash
 cp vino.example.json vino.json
-export VINO_PROVIDER_OPENAI_API_KEY=sk-...   # or edit apiKey in vino.json
+cp .env.example .env
+# edit .env (or vino.json, or export VINO_PROVIDER_OPENAI_API_KEY=sk-...)
 go run ./cmd/server --config vino.json
 ```
+
+If a `.env` file is present it is loaded automatically (override its path with
+`--env`). See [Environment overrides](#environment-overrides).
 
 You should see:
 
@@ -73,6 +77,26 @@ the provider name uppercased and `<FIELD>` is one of `API_KEY`, `BASE_URL`,
 | `VINO_PROVIDER_OPENAI_API_KEY` | `providers.openai.apiKey` |
 | `VINO_PROVIDER_OPENAI_BASE_URL` | `providers.openai.baseURL` |
 | `VINO_PROVIDER_OPENAI_MODEL` | `providers.openai.model` |
+
+#### `.env` file
+
+These variables can also come from a `.env` file (default path `.env`, override
+with `--env`), so credentials don't have to be exported into every shell:
+
+```bash
+# .env
+VINO_PROVIDER_OPENAI_API_KEY=sk-...
+```
+
+Rules:
+
+- The `.env` file is optional — a missing file is not an error.
+- The **real environment wins**: a variable already exported in the shell is
+  never overwritten by `.env`.
+- `.env` is loaded before the config file, so its values participate in
+  provider resolution and validation exactly like exported variables.
+- Supported syntax: full-line `#` comments, blank lines, `export ` prefix,
+  single-/double-quoted values, and trailing ` #` inline comments.
 
 ### Validation
 

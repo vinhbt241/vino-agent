@@ -13,7 +13,12 @@ import (
 
 func main() {
 	cfgPath := flag.String("config", "vino.json", "path to server config file")
+	envPath := flag.String("env", ".env", "path to .env file (optional)")
 	flag.Parse()
+
+	if err := api.LoadDotenv(*envPath); err != nil {
+		log.Fatalf("loading .env: %v", err)
+	}
 
 	cfg, err := api.LoadConfig(*cfgPath)
 	if err != nil {
