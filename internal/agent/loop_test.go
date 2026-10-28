@@ -403,3 +403,29 @@ func TestRun_NoSystemPrompt(t *testing.T) {
 		t.Fatalf("messages = %#v, want a single user message (no system prompt)", msgs)
 	}
 }
+
+func TestRun_ForwardsToolSpecsToLLM(t *testing.T) {
+	reg := &fakeRegistry{
+		specs:   []ToolSpec{{Name: "read", Description: "read a file", Parameters: json.RawMessage(`{"type":"object"}`)}},
+		results: map[string]fakeToolResult{"read": {result: "ok"}},
+	}
+	llm := &fakeLLM{steps: []fakeStep{{resp: Response{Content: "ok"}}}}
+	a := Agent{LLM: llm}
+
+	_, err := a.Run(context.Background(), RunInput{
+		Model:    "m",
+		Messages: []Message{{Role: RoleUser, Content: "go"}},
+		Tools:    reg,
+	}, func(Event) error { return nil })
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	if len(llm.tools) != 1 {
+		t.Fatalf("len(llm.tools) = %d, want 1", len(llm.tools))
+	}
+	got := llm.tools[0]
+	if len(got) != 1 || got[0].Name != "read" || got[0].Description != "read a file" || string(got[0].Parameters) != `{"type":"object"}` {
+		t.Fatalf("llm.tools[0] = %#v, want the registry's read spec", got)
+	}
+}

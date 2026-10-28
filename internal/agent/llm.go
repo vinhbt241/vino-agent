@@ -9,7 +9,8 @@ type Response struct {
 	ToolCalls []ToolCall
 }
 
-// LLM is a streaming chat model.
+// LLM is a streaming chat model. tools are the tool declarations the model
+// may call; it is nil or empty when no tools are available.
 type LLM interface {
-	Chat(ctx context.Context, messages []Message, onDelta func(string) error) (Response, error)
+	Chat(ctx context.Context, messages []Message, tools []ToolSpec, onDelta func(string) error) (Response, error)
 }

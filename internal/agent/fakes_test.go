@@ -14,15 +14,17 @@ type fakeStep struct {
 	err    error
 }
 
-// fakeLLM is a scripted LLM for tests. It records every message list it is
-// given and pops one fakeStep per Chat call.
+// fakeLLM is a scripted LLM for tests. It records every message list and tool
+// spec list it is given and pops one fakeStep per Chat call.
 type fakeLLM struct {
 	steps []fakeStep
 	calls [][]Message
+	tools [][]ToolSpec
 }
 
-func (f *fakeLLM) Chat(_ context.Context, msgs []Message, onDelta func(string) error) (Response, error) {
+func (f *fakeLLM) Chat(_ context.Context, msgs []Message, tools []ToolSpec, onDelta func(string) error) (Response, error) {
 	f.calls = append(f.calls, append([]Message(nil), msgs...))
+	f.tools = append(f.tools, append([]ToolSpec(nil), tools...))
 	if len(f.steps) == 0 {
 		return Response{}, errors.New("fakeLLM: no more scripted steps")
 	}

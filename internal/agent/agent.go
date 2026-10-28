@@ -51,13 +51,14 @@ func (a Agent) Run(ctx context.Context, in RunInput, sink EventSink) (RunResult,
 	}
 
 	messages := buildMessages(in)
+	tools := toolSpecs(in)
 
 	for i := 0; i < maxIter; i++ {
 		if err := ctx.Err(); err != nil {
 			return RunResult{}, err
 		}
 
-		resp, err := a.LLM.Chat(ctx, messages, func(delta string) error {
+		resp, err := a.LLM.Chat(ctx, messages, tools, func(delta string) error {
 			return sink(Event{Type: EventTextDelta, TextDelta: &TextDelta{Text: delta}})
 		})
 		if err != nil {
@@ -107,6 +108,15 @@ func (a Agent) finish(sink EventSink, assistant Message, messages []Message, ite
 		return RunResult{}, err
 	}
 	return res, nil
+}
+
+// toolSpecs returns the tool declarations passed to the model, or nil when
+// no registry is configured.
+func toolSpecs(in RunInput) []ToolSpec {
+	if in.Tools == nil {
+		return nil
+	}
+	return in.Tools.Specs()
 }
 
 // callTool executes a single tool call, applying the per-run tool timeout.
