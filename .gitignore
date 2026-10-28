@@ -1,1 +1,4 @@
 /.scratch/
+.env
+vino.json
+/workspace/
