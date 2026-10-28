@@ -1,0 +1,15 @@
+{
+  "addr": "127.0.0.1:8080",
+  "default": "openai",
+  "providers": {
+    "openai": {
+      "apiKey": "",
+      "baseURL": "https://api.openai.com/v1",
+      "model": "gpt-4o"
+    }
+  },
+  "tools": {
+    "rootDir": "",
+    "workDir": ""
+  }
+}
