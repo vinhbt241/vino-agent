@@ -106,6 +106,24 @@ func (h *Harness) Entry(ctx context.Context, id ID) (*EntryRecord, error) {
 	return h.session.storage.Entry(ctx, id)
 }
 
+// Conversation returns a handle for an existing conversation by ID, or
+// ErrConversationNotFound if it does not exist.
+func (h *Harness) Conversation(ctx context.Context, id ID) (*Conversation, error) {
+	conv, err := h.session.storage.Conversation(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if conv == nil {
+		return nil, ErrConversationNotFound
+	}
+	return &Conversation{h: h, id: id}, nil
+}
+
+// ScanConversations pages over conversations matching q.
+func (h *Harness) ScanConversations(ctx context.Context, q ConversationQuery, limit int, cursor *Cursor) (*Page[ConversationRecord], error) {
+	return h.session.storage.ScanConversations(ctx, q, limit, cursor)
+}
+
 // StartInput seeds a fresh conversation with a message history and runs it.
 type StartInput struct {
 	RequestID     string
@@ -124,17 +142,19 @@ func (h *Harness) Start(ctx context.Context, in StartInput, sink agent.EventSink
 			return nil, err
 		} else if ex != nil {
 			h.registerSink(ex.ID, sink)
-			return &Submission{h: h, rec: ex}, nil
+			return &Submission{h: h, rec: ex, resumed: true}, nil
 		}
 	}
 
 	var sub *SubmissionRecord
+	resumed := false
 	err := h.session.Commit(ctx, func(tx *Tx) error {
 		if in.RequestID != "" {
 			if ex, err := tx.SubmissionByRequest(ctx, in.RequestID); err != nil {
 				return err
 			} else if ex != nil {
 				sub = ex
+				resumed = true
 				return nil
 			}
 		}
@@ -199,7 +219,7 @@ func (h *Harness) Start(ctx context.Context, in StartInput, sink agent.EventSink
 		return nil, err
 	}
 	h.registerSink(sub.ID, sink)
-	return &Submission{h: h, rec: sub}, nil
+	return &Submission{h: h, rec: sub, resumed: resumed}, nil
 }
 
 // buildMessages derives the model context for a conversation: the system

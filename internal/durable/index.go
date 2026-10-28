@@ -212,6 +212,9 @@ func (ix *recordIndex) submissionByRequest(requestID string) *SubmissionRecord {
 func (ix *recordIndex) scanConversations(q ConversationQuery, limit int, cursor *Cursor) *Page[ConversationRecord] {
 	var items []ConversationRecord
 	for _, rec := range ix.conversations {
+		if q.ExcludeRoot && rec.ID == RootConversationID {
+			continue
+		}
 		if q.OwnerConversationID != nil && (rec.Owner == nil || rec.Owner.ConversationID != *q.OwnerConversationID) {
 			continue
 		}

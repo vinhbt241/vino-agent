@@ -43,7 +43,10 @@ type Page[T any] struct {
 type ConversationQuery struct {
 	OwnerConversationID *ID
 	OwnerTaskID         *ID
-	Order               ScanOrder
+	// ExcludeRoot drops the harness's singleton root conversation from the
+	// scan. It is an internal bookkeeping conversation, not a user one.
+	ExcludeRoot bool
+	Order       ScanOrder
 }
 
 // EntryQuery filters an entry scan. MinID/MaxID are inclusive.

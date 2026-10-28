@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -48,7 +49,72 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Begin the SSE stream before the first event is written.
+	s.streamSubmission(w, r, func(sink agent.EventSink) (*durable.Submission, error) {
+		return s.harness.Start(r.Context(), durable.StartInput{
+			RequestID:     req.RequestID,
+			SystemPrompt:  req.SystemPrompt,
+			Messages:      messages,
+			MaxIterations: req.MaxIterations,
+			ToolTimeout:   timeout,
+		}, sink)
+	})
+}
+
+// handleResumeConversation appends turns to an existing conversation and
+// streams the run exactly like handleRun.
+func (s *Server) handleResumeConversation(w http.ResponseWriter, r *http.Request) {
+	id, err := parseID(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid conversation id")
+		return
+	}
+	if id == durable.RootConversationID {
+		writeError(w, http.StatusNotFound, "conversation not found")
+		return
+	}
+
+	var req runRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	timeout, err := parseTimeout(req.ToolTimeout)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	messages, err := toMessages(req.Messages)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	c, err := s.harness.Conversation(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, durable.ErrConversationNotFound) {
+			writeError(w, http.StatusNotFound, "conversation not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.streamSubmission(w, r, func(sink agent.EventSink) (*durable.Submission, error) {
+		return c.SubmitStream(r.Context(), durable.SubmitInput{
+			RequestID:     req.RequestID,
+			SystemPrompt:  req.SystemPrompt,
+			Messages:      messages,
+			MaxIterations: req.MaxIterations,
+			ToolTimeout:   timeout,
+		}, sink)
+	})
+}
+
+// streamSubmission opens the SSE stream, creates a submission with sink, emits
+// the leading run_started, and waits for the run to settle, mapping the
+// terminal state to SSE events. It is shared by handleRun and
+// handleResumeConversation.
+func (s *Server) streamSubmission(w http.ResponseWriter, r *http.Request, create func(sink agent.EventSink) (*durable.Submission, error)) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -60,26 +126,31 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	finished := false
+	var conversationID, submissionID string
 	sink := func(ev agent.Event) error {
 		if ev.Type == agent.EventRunFinished {
 			finished = true
 		}
-		name, data, err := sseEvent(ev)
+		name, data, err := sseEvent(ev, conversationID)
 		if err != nil {
 			return err
 		}
 		return writeSSE(w, flusher, name, data)
 	}
 
-	sub, err := s.harness.Start(r.Context(), durable.StartInput{
-		RequestID:     req.RequestID,
-		SystemPrompt:  req.SystemPrompt,
-		Messages:      messages,
-		MaxIterations: req.MaxIterations,
-		ToolTimeout:   timeout,
-	}, sink)
+	sub, err := create(sink)
 	if err != nil {
 		_ = writeSSE(w, flusher, "error", map[string]string{"error": err.Error()})
+		return
+	}
+
+	conversationID = formatID(sub.ConversationID())
+	submissionID = formatID(sub.ID())
+	if err := writeSSE(w, flusher, "run_started", runStartedDTO{
+		ConversationID: conversationID,
+		SubmissionID:   submissionID,
+		Resumed:        sub.Resumed(),
+	}); err != nil {
 		return
 	}
 
@@ -95,7 +166,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 			// A retry that joined a run which already answered: replay the
 			// terminal event from the stored answer.
 			msg := s.answerMessage(r.Context(), rec)
-			_ = writeSSE(w, flusher, "run_finished", runFinishedDTO{FinalMessage: msg})
+			_ = writeSSE(w, flusher, "run_finished", runFinishedDTO{FinalMessage: msg, ConversationID: conversationID})
 		}
 	case durable.SubmissionUnanswered:
 		_ = writeSSE(w, flusher, "error", map[string]string{"error": rec.Reason})
@@ -162,7 +233,7 @@ func toMessages(msgs []runMessage) ([]agent.Message, error) {
 }
 
 // sseEvent maps an agent.Event to its SSE event name and data payload.
-func sseEvent(ev agent.Event) (string, any, error) {
+func sseEvent(ev agent.Event, conversationID string) (string, any, error) {
 	switch ev.Type {
 	case agent.EventTextDelta:
 		return "text_delta", textDeltaDTO{Text: ev.TextDelta.Text}, nil
@@ -180,7 +251,7 @@ func sseEvent(ev agent.Event) (string, any, error) {
 			Error:  ev.ToolResult.Error,
 		}, nil
 	case agent.EventRunFinished:
-		return "run_finished", runFinishedDTO{FinalMessage: ev.RunFinished.FinalMessage}, nil
+		return "run_finished", runFinishedDTO{FinalMessage: ev.RunFinished.FinalMessage, ConversationID: conversationID}, nil
 	default:
 		return "", nil, fmt.Errorf("api: unknown event type %q", ev.Type)
 	}
@@ -204,7 +275,14 @@ type toolResultDTO struct {
 }
 
 type runFinishedDTO struct {
-	FinalMessage agent.Message `json:"finalMessage"`
+	FinalMessage   agent.Message `json:"finalMessage"`
+	ConversationID string        `json:"conversationId"`
+}
+
+type runStartedDTO struct {
+	ConversationID string `json:"conversationId"`
+	SubmissionID   string `json:"submissionId"`
+	Resumed        bool   `json:"resumed"`
 }
 
 // writeSSE writes one SSE event frame and flushes it to the client.

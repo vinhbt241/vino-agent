@@ -72,18 +72,96 @@ data: <JSON object>
 
 ```
 
+### `GET /conversations`
+
+List conversations, newest first. The harness's internal root conversation
+(ID `1`) is excluded.
+
+**Query params**
+
+| Param | Meaning |
+|---|---|
+| `limit` | Page size. Default `50`, cap `200`. |
+| `cursor` | Opaque cursor from a previous page's `nextCursor`. |
+| `order` | `desc` (default) or `asc`, by conversation ID. |
+
+**Response `200`**
+
+```json
+{
+  "conversations": [
+    {
+      "id": "12",
+      "parent": {"conversationId": "3", "at": "40"},
+      "owner": {"conversationId": "3", "taskId": "41"},
+      "latestMessage": {"role": "assistant", "content": "Here you go…", "truncated": true}
+    }
+  ],
+  "nextCursor": "12"
+}
+```
+
+- `parent` and `owner` are present only when the conversation is a fork or is
+  task-owned.
+- `latestMessage` is the last user/assistant turn (skipping tool turns),
+  truncated to 200 runes with a `…` suffix; `truncated` is `false` when
+  nothing was cut. Omitted when there is no such turn.
+- `nextCursor` is `null` on the last page. IDs are strings.
+
+### `GET /conversations/{id}`
+
+One conversation with its full transcript.
+
+**Response `200`**
+
+```json
+{
+  "id": "12",
+  "entries": [
+    {"id": "10", "kind": "user", "message": {"role": "user", "content": "hi"}},
+    {"id": "11", "kind": "assistant", "message": {"role": "assistant", "content": "hello"}}
+  ]
+}
+```
+
+`message` uses the `finalMessage` shape (`role`, `content`, `tool_calls`,
+`tool_call_id`, `name`).
+
+**Errors**
+
+| Status | When |
+|---|---|
+| `404` | Unknown conversation, or the internal root conversation (`1`). |
+| `400` | `{id}` is not a numeric ID. |
+
+### `POST /conversations/{id}/runs`
+
+Append turns to an existing conversation and stream the result as SSE. The
+request body, validation, and SSE events are identical to `POST /runs`
+(including `requestId` exactly-once); the given `messages` are appended to the
+conversation's transcript in order.
+
+**Errors**
+
+| Status | When |
+|---|---|
+| `404` | Unknown conversation, or the internal root conversation (`1`). |
+| `400` | Malformed `{id}`, or the same body errors as `POST /runs`. |
+
 ## SSE events
 
-Events arrive in this order: zero or more `text_delta`, then optionally
-`tool_call_started`/`tool_result` pairs (which may repeat across iterations),
-terminated by exactly one of `run_finished` or `error`.
+Events arrive in this order: a leading `run_started`, then zero or more
+`text_delta`, then optionally `tool_call_started`/`tool_result` pairs (which
+may repeat across iterations), terminated by exactly one of `run_finished` or
+`error`.
 
 | Event | Data | Meaning |
 |---|---|---|
+| `run_started` | `{"conversationId":"...","submissionId":"...","resumed":false}` | Always first. `resumed` is `true` when `requestId` matched an existing run. |
 | `text_delta` | `{"text":"..."}` | A chunk of streamed assistant text. Concatenate `text` in order. |
 | `tool_call_started` | `{"id":"...","name":"...","arguments":{...}}` | The model requested a tool call. `arguments` is the tool's JSON object. |
 | `tool_result` | `{"id":"...","name":"...","result":"...","error":"..."}` | Outcome of a tool call. On success `error` is omitted and `result` holds output; on failure `error` is set. |
-| `run_finished` | `{"finalMessage":{...}}` | Run completed. `finalMessage` is the final assistant message (see below). |
+| `run_finished` | `{"finalMessage":{...},"conversationId":"..."}` | Run completed. `finalMessage` is the final assistant message (see below). |
 | `error` | `{"error":"..."}` | Run aborted. Terminal; the stream closes after it. |
 
 ### `finalMessage` shape
@@ -105,9 +183,9 @@ For a completed run `role` is always `"assistant"` and `tool_calls` is empty.
 
 | Status | When | Body |
 |---|---|---|
-| `400` | Invalid JSON body, empty `messages`, bad `role`, empty `content`, or malformed/negative `toolTimeout` | `{"error":"..."}` |
+| `400` | Invalid JSON body, empty `messages`, bad `role`, empty `content`, malformed/negative `toolTimeout`, malformed conversation `{id}`, or bad list query params (`limit`/`order`/`cursor`) | `{"error":"..."}` |
+| `404` | Unknown path, unknown conversation, or the internal root conversation (`1`) | `{"error":"..."}` (for conversation lookups) |
 | `405` | Wrong HTTP method | (Go `ServeMux` response with an `Allow` header) |
-| `404` | Unknown path | |
 
 Runtime failures (provider unreachable, max iterations exceeded, tool error
 that aborts the run, client disconnect) do **not** use an HTTP error status —
@@ -116,6 +194,9 @@ they are reported as a final SSE `error` event on the `200` stream.
 ## Full example transcript
 
 ```
+event: run_started
+data: {"conversationId":"12","submissionId":"14","resumed":false}
+
 event: text_delta
 data: {"text":"I'll list the files."}
 
@@ -129,7 +210,7 @@ event: text_delta
 data: {"text":"Here's the listing: main.go, go.mod."}
 
 event: run_finished
-data: {"finalMessage":{"role":"assistant","content":"Here's the listing: main.go, go.mod."}}
+data: {"finalMessage":{"role":"assistant","content":"Here's the listing: main.go, go.mod."},"conversationId":"12"}
 
 ```
 

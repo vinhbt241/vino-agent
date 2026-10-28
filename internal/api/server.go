@@ -54,6 +54,9 @@ func newServer(harness *durable.Harness) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("POST /runs", s.handleRun)
+	mux.HandleFunc("GET /conversations", s.handleListConversations)
+	mux.HandleFunc("GET /conversations/{id}", s.handleGetConversation)
+	mux.HandleFunc("POST /conversations/{id}/runs", s.handleResumeConversation)
 	s.mux = mux
 	return s
 }

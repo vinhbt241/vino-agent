@@ -19,12 +19,14 @@ type llmStep struct {
 }
 
 type fakeLLM struct {
-	steps []llmStep
-	calls int
+	steps    []llmStep
+	calls    int
+	messages [][]agent.Message
 }
 
-func (f *fakeLLM) Chat(_ context.Context, _ []agent.Message, _ []agent.ToolSpec, onDelta func(string) error) (agent.Response, error) {
+func (f *fakeLLM) Chat(_ context.Context, msgs []agent.Message, _ []agent.ToolSpec, onDelta func(string) error) (agent.Response, error) {
 	f.calls++
+	f.messages = append(f.messages, append([]agent.Message(nil), msgs...))
 	if len(f.steps) == 0 {
 		return agent.Response{}, fmt.Errorf("fakeLLM: no more scripted steps")
 	}

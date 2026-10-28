@@ -13,6 +13,9 @@ var (
 	// ErrTaskTerminal is returned when a runtime operation targets a task
 	// that is already terminal.
 	ErrTaskTerminal = errors.New("durable: task is terminal")
+	// ErrConversationNotFound is returned when a runtime operation targets a
+	// conversation that does not exist.
+	ErrConversationNotFound = errors.New("durable: conversation not found")
 )
 
 // Session owns the mutation line: one writer at a time, atomic commits across

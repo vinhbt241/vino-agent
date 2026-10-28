@@ -76,22 +76,25 @@ func TestRun_StreamsTextAndFinish(t *testing.T) {
 	}
 
 	frames := parseSSE(rr.Body.String())
-	if len(frames) != 3 {
-		t.Fatalf("len(frames) = %d, want 3: %#v", len(frames), frames)
+	if len(frames) != 4 {
+		t.Fatalf("len(frames) = %d, want 4: %#v", len(frames), frames)
 	}
-	if frames[0].name != "text_delta" || frames[0].data != `{"text":"Hel"}` {
-		t.Fatalf("frames[0] = %#v, want text_delta Hel", frames[0])
+	if frames[0].name != "run_started" {
+		t.Fatalf("frames[0] = %#v, want run_started", frames[0])
 	}
-	if frames[1].name != "text_delta" || frames[1].data != `{"text":"lo"}` {
-		t.Fatalf("frames[1] = %#v, want text_delta lo", frames[1])
+	if frames[1].name != "text_delta" || frames[1].data != `{"text":"Hel"}` {
+		t.Fatalf("frames[1] = %#v, want text_delta Hel", frames[1])
 	}
-	if frames[2].name != "run_finished" {
-		t.Fatalf("frames[2] = %#v, want run_finished", frames[2])
+	if frames[2].name != "text_delta" || frames[2].data != `{"text":"lo"}` {
+		t.Fatalf("frames[2] = %#v, want text_delta lo", frames[2])
+	}
+	if frames[3].name != "run_finished" {
+		t.Fatalf("frames[3] = %#v, want run_finished", frames[3])
 	}
 	var fin struct {
 		FinalMessage agent.Message `json:"finalMessage"`
 	}
-	if err := json.Unmarshal([]byte(frames[2].data), &fin); err != nil {
+	if err := json.Unmarshal([]byte(frames[3].data), &fin); err != nil {
 		t.Fatalf("unmarshal run_finished data: %v", err)
 	}
 	if fin.FinalMessage.Content != "Hello" {
@@ -110,17 +113,85 @@ func TestRun_ToolCallEvents(t *testing.T) {
 	rr := doRun(t, s, `{"messages":[{"role":"user","content":"read /x"}]}`)
 
 	frames := parseSSE(rr.Body.String())
-	if len(frames) != 3 {
-		t.Fatalf("len(frames) = %d, want 3: %#v", len(frames), frames)
+	if len(frames) != 4 {
+		t.Fatalf("len(frames) = %d, want 4: %#v", len(frames), frames)
 	}
-	if frames[0].name != "tool_call_started" || frames[0].data != `{"id":"c1","name":"read","arguments":{"path":"/x"}}` {
-		t.Fatalf("frames[0] = %#v, want tool_call_started", frames[0])
+	if frames[0].name != "run_started" {
+		t.Fatalf("frames[0] = %#v, want run_started", frames[0])
 	}
-	if frames[1].name != "tool_result" || frames[1].data != `{"id":"c1","name":"read","result":"file contents"}` {
-		t.Fatalf("frames[1] = %#v, want tool_result", frames[1])
+	if frames[1].name != "tool_call_started" || frames[1].data != `{"id":"c1","name":"read","arguments":{"path":"/x"}}` {
+		t.Fatalf("frames[1] = %#v, want tool_call_started", frames[1])
 	}
-	if frames[2].name != "run_finished" {
-		t.Fatalf("frames[2] = %#v, want run_finished", frames[2])
+	if frames[2].name != "tool_result" || frames[2].data != `{"id":"c1","name":"read","result":"file contents"}` {
+		t.Fatalf("frames[2] = %#v, want tool_result", frames[2])
+	}
+	if frames[3].name != "run_finished" {
+		t.Fatalf("frames[3] = %#v, want run_finished", frames[3])
+	}
+}
+
+func TestRun_EmitsRunStartedFirst(t *testing.T) {
+	llm := &fakeLLM{steps: []fakeStep{{resp: agent.Response{Content: "hi"}}}}
+	s := newTestServer(t, llm, &fakeRegistry{})
+
+	rr := doRun(t, s, `{"messages":[{"role":"user","content":"hi"}]}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+
+	frames := parseSSE(rr.Body.String())
+	if len(frames) < 2 {
+		t.Fatalf("frames = %#v, want run_started then run_finished", frames)
+	}
+	if frames[0].name != "run_started" {
+		t.Fatalf("first frame = %q, want run_started", frames[0].name)
+	}
+	var started struct {
+		ConversationID string `json:"conversationId"`
+		SubmissionID   string `json:"submissionId"`
+		Resumed        bool   `json:"resumed"`
+	}
+	if err := json.Unmarshal([]byte(frames[0].data), &started); err != nil {
+		t.Fatalf("unmarshal run_started: %v", err)
+	}
+	if started.ConversationID == "" || started.SubmissionID == "" {
+		t.Fatalf("run_started ids = %#v, want non-empty strings", started)
+	}
+	if started.Resumed {
+		t.Fatal("run_started.resumed = true, want false for a new run")
+	}
+
+	last := frames[len(frames)-1]
+	if last.name != "run_finished" {
+		t.Fatalf("last frame = %q, want run_finished", last.name)
+	}
+	var fin struct {
+		FinalMessage   agent.Message `json:"finalMessage"`
+		ConversationID string        `json:"conversationId"`
+	}
+	if err := json.Unmarshal([]byte(last.data), &fin); err != nil {
+		t.Fatalf("unmarshal run_finished: %v", err)
+	}
+	if fin.ConversationID != started.ConversationID {
+		t.Fatalf("run_finished.conversationId = %q, want %q", fin.ConversationID, started.ConversationID)
+	}
+}
+
+func TestRun_EmitsRunStartedBeforeError(t *testing.T) {
+	llm := &fakeLLM{steps: []fakeStep{{err: errors.New("boom")}}}
+	s := newTestServer(t, llm, &fakeRegistry{})
+
+	rr := doRun(t, s, `{"messages":[{"role":"user","content":"hi"}]}`)
+
+	frames := parseSSE(rr.Body.String())
+	if len(frames) != 2 {
+		t.Fatalf("frames = %#v, want run_started then error", frames)
+	}
+	if frames[0].name != "run_started" {
+		t.Fatalf("first frame = %q, want run_started", frames[0].name)
+	}
+	if frames[1].name != "error" {
+		t.Fatalf("second frame = %q, want error", frames[1].name)
 	}
 }
 
@@ -131,16 +202,19 @@ func TestRun_LLMErrorEmitsErrorEvent(t *testing.T) {
 	rr := doRun(t, s, `{"messages":[{"role":"user","content":"hi"}]}`)
 
 	frames := parseSSE(rr.Body.String())
-	if len(frames) != 1 {
-		t.Fatalf("len(frames) = %d, want 1: %#v", len(frames), frames)
+	if len(frames) != 2 {
+		t.Fatalf("len(frames) = %d, want 2: %#v", len(frames), frames)
 	}
-	if frames[0].name != "error" {
-		t.Fatalf("frames[0].name = %q, want error", frames[0].name)
+	if frames[0].name != "run_started" {
+		t.Fatalf("frames[0].name = %q, want run_started", frames[0].name)
+	}
+	if frames[1].name != "error" {
+		t.Fatalf("frames[1].name = %q, want error", frames[1].name)
 	}
 	var ev struct {
 		Error string `json:"error"`
 	}
-	if err := json.Unmarshal([]byte(frames[0].data), &ev); err != nil {
+	if err := json.Unmarshal([]byte(frames[1].data), &ev); err != nil {
 		t.Fatalf("unmarshal error data: %v", err)
 	}
 	if ev.Error != "llm down" {
@@ -248,15 +322,24 @@ func TestRun_RequestIDDedup(t *testing.T) {
 	rr2 := doRun(t, s, body)
 
 	frames1 := parseSSE(rr1.Body.String())
-	if len(frames1) != 1 || frames1[0].name != "run_finished" {
-		t.Fatalf("first frames = %#v, want [run_finished]", frames1)
+	if len(frames1) != 2 || frames1[0].name != "run_started" || frames1[1].name != "run_finished" {
+		t.Fatalf("first frames = %#v, want [run_started run_finished]", frames1)
 	}
 	frames2 := parseSSE(rr2.Body.String())
-	if len(frames2) != 1 || frames2[0].name != "run_finished" {
-		t.Fatalf("retry frames = %#v, want [run_finished] replayed from storage", frames2)
+	if len(frames2) != 2 || frames2[0].name != "run_started" || frames2[1].name != "run_finished" {
+		t.Fatalf("retry frames = %#v, want [run_started run_finished] replayed from storage", frames2)
 	}
-	if !strings.Contains(frames2[0].data, "answer") {
-		t.Fatalf("retry frame data = %q, want stored answer", frames2[0].data)
+	var started struct {
+		Resumed bool `json:"resumed"`
+	}
+	if err := json.Unmarshal([]byte(frames2[0].data), &started); err != nil {
+		t.Fatalf("unmarshal retry run_started: %v", err)
+	}
+	if !started.Resumed {
+		t.Fatalf("retry run_started.resumed = false, want true")
+	}
+	if !strings.Contains(frames2[1].data, "answer") {
+		t.Fatalf("retry frame data = %q, want stored answer", frames2[1].data)
 	}
 	if len(llm.calls) != 1 {
 		t.Fatalf("llm calls = %d, want 1 (dedup must not start a second run)", len(llm.calls))
