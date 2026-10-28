@@ -112,6 +112,8 @@ The server refuses to start if:
 
 ## API
 
+The full client-facing reference (request schemas, SSE event contracts, error
+codes, and a JavaScript fetch example) lives in [`docs/api.md`](docs/api.md).
 Both endpoints are served over HTTP, loopback-only by default.
 
 ### `GET /health`
