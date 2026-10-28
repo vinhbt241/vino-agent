@@ -96,6 +96,11 @@ func (h *Harness) Run(ctx context.Context) error {
 	return h.scheduler.Run(ctx)
 }
 
+// Close closes the harness's storage backend.
+func (h *Harness) Close(ctx context.Context) error {
+	return h.session.storage.Close(ctx)
+}
+
 // Entry reads a committed transcript entry.
 func (h *Harness) Entry(ctx context.Context, id ID) (*EntryRecord, error) {
 	return h.session.storage.Entry(ctx, id)

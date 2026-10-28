@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -291,5 +292,79 @@ func TestNewServer_WiresDurableStore(t *testing.T) {
 	// The durable log was created.
 	if _, err := os.Stat(loaded.DurablePath); err != nil {
 		t.Fatalf("durable log not created: %v", err)
+	}
+}
+
+func TestRestartRecovery_ResumesInterruptedRun(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vino.jsonl")
+	body := `{"requestId":"job-1","messages":[{"role":"user","content":"find"}]}`
+
+	// --- First server: a run that dies mid-tool-call ---
+	llm1 := &fakeLLM{steps: []fakeStep{
+		{resp: agent.Response{ToolCalls: []agent.ToolCall{{ID: "c1", Name: "search", Arguments: json.RawMessage(`{}`)}}}},
+	}}
+	reg1 := &blockingRegistry{started: make(chan struct{}), release: make(chan struct{})}
+	h1 := openHarness(t, path, llm1, reg1)
+	s1 := newServer(h1)
+
+	unwound := make(chan struct{})
+	go func() {
+		defer close(unwound)
+		req := httptest.NewRequest(http.MethodPost, "/runs", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		// Blocks inside the tool; abandoned like a dead process.
+		s1.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+
+	select {
+	case <-reg1.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("tool never started")
+	}
+
+	// Crash: close the first process's storage mid-run.
+	if err := h1.Close(context.Background()); err != nil {
+		t.Fatalf("close crashed harness: %v", err)
+	}
+
+	// --- Second server over the same log resumes the run ---
+	llm2 := &fakeLLM{steps: []fakeStep{{resp: agent.Response{Content: "recovered"}}}}
+	reg2 := &fakeRegistry{result: "hit"}
+	h2 := openHarness(t, path, llm2, reg2)
+	s2 := newServer(h2)
+
+	rr := doRun(t, s2, body)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("resumed run status = %d, want 200", rr.Code)
+	}
+	frames := parseSSE(rr.Body.String())
+	if len(frames) < 2 {
+		t.Fatalf("frames = %#v, want tool_result then run_finished", frames)
+	}
+	if frames[len(frames)-1].name != "run_finished" {
+		t.Fatalf("last frame = %#v, want run_finished", frames[len(frames)-1])
+	}
+	if !strings.Contains(frames[len(frames)-1].data, "recovered") {
+		t.Fatalf("run_finished data = %q, want recovered answer", frames[len(frames)-1].data)
+	}
+	// The safe tool re-ran in the new process.
+	foundToolResult := false
+	for _, fr := range frames {
+		if fr.name == "tool_result" && strings.Contains(fr.data, "hit") {
+			foundToolResult = true
+		}
+	}
+	if !foundToolResult {
+		t.Fatalf("frames = %#v, want a tool_result with the re-run tool output", frames)
+	}
+
+	// Cleanup: release the first process's blocked tool so its goroutine can
+	// unwind (its storage is closed, so the commit fails and it just exits).
+	close(reg1.release)
+	select {
+	case <-unwound:
+	case <-time.After(10 * time.Second):
+		t.Fatal("crashed run goroutine did not unwind")
 	}
 }

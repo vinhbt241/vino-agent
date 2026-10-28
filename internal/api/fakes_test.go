@@ -21,6 +21,21 @@ func newTestServer(t *testing.T, llm agent.LLM, reg agent.ToolRegistry) *Server 
 	return newServer(h)
 }
 
+// openHarness opens a harness over the JSONL log at path, as a server restart
+// would.
+func openHarness(t *testing.T, path string, llm agent.LLM, reg agent.ToolRegistry) *durable.Harness {
+	t.Helper()
+	store, err := durable.OpenJSONL(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := durable.Open(context.Background(), store, durable.HarnessOptions{LLM: llm, Tools: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
 // fakeStep is one scripted LLM turn.
 type fakeStep struct {
 	deltas []string
@@ -62,4 +77,21 @@ func (f *fakeRegistry) Specs() []agent.ToolSpec { return nil }
 
 func (f *fakeRegistry) Call(_ context.Context, _ string, _ json.RawMessage) (string, error) {
 	return f.result, f.err
+}
+
+// blockingRegistry blocks its first Call until released, to simulate a tool
+// whose process is killed mid-execution. Its one tool is replay-safe.
+type blockingRegistry struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingRegistry) Specs() []agent.ToolSpec {
+	return []agent.ToolSpec{{Name: "search", Replay: agent.ReplaySafe}}
+}
+
+func (b *blockingRegistry) Call(_ context.Context, _ string, _ json.RawMessage) (string, error) {
+	close(b.started)
+	<-b.release
+	return "hit", nil
 }
