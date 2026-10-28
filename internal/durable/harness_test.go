@@ -1,0 +1,377 @@
+package durable
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+
+	"vino/internal/agent"
+)
+
+// ---- fakes ----
+
+type llmStep struct {
+	deltas []string
+	resp   agent.Response
+	err    error
+}
+
+type fakeLLM struct {
+	steps []llmStep
+	calls int
+}
+
+func (f *fakeLLM) Chat(_ context.Context, _ []agent.Message, _ []agent.ToolSpec, onDelta func(string) error) (agent.Response, error) {
+	f.calls++
+	if len(f.steps) == 0 {
+		return agent.Response{}, fmt.Errorf("fakeLLM: no more scripted steps")
+	}
+	s := f.steps[0]
+	f.steps = f.steps[1:]
+	if s.err != nil {
+		return agent.Response{}, s.err
+	}
+	for _, d := range s.deltas {
+		if err := onDelta(d); err != nil {
+			return agent.Response{}, err
+		}
+	}
+	return s.resp, nil
+}
+
+type fakeRegistry struct {
+	specs   []agent.ToolSpec
+	results map[string]string
+	calls   []string
+}
+
+func (f *fakeRegistry) Specs() []agent.ToolSpec { return f.specs }
+func (f *fakeRegistry) Call(_ context.Context, name string, _ json.RawMessage) (string, error) {
+	f.calls = append(f.calls, name)
+	return f.results[name], nil
+}
+
+// ---- helpers ----
+
+func write(t *testing.T, st Storage, ctx context.Context, writes []StorageWrite) {
+	t.Helper()
+	if _, err := st.Commit(ctx, writes); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mint(t *testing.T, st Storage, ctx context.Context) ID {
+	t.Helper()
+	id, err := st.MintID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func toolEntryContent(t *testing.T, entries []EntryRecord) string {
+	t.Helper()
+	for _, e := range entries {
+		if e.Kind == kindTool && len(e.Model) > 0 {
+			return e.Model[0].Content
+		}
+	}
+	t.Fatal("no tool entry found")
+	return ""
+}
+
+// seedCrashedTool writes a transcript that crashed mid-tool-call: a running
+// tool task with a generation task waiting on it.
+func seedCrashedTool(t *testing.T, st Storage, replaySafe bool) {
+	t.Helper()
+	ctx := context.Background()
+	write(t, st, ctx, []StorageWrite{
+		{Type: WriteConversation, Value: &ConversationRecord{ID: RootConversationID}},
+	})
+	userID := mint(t, st, ctx)
+	assistantID := mint(t, st, ctx)
+	genID := mint(t, st, ctx)
+	toolID := mint(t, st, ctx)
+
+	toolInputRaw := mustJSON(toolInput{CallID: "call1", Name: "search", Arguments: json.RawMessage(`{}`), ReplaySafe: replaySafe})
+	write(t, st, ctx, []StorageWrite{
+		{Type: WriteEntry, Value: &EntryRecord{ID: userID, ConversationID: RootConversationID, Kind: kindUser,
+			Model: []agent.Message{{Role: agent.RoleUser, Content: "find x"}}}},
+		{Type: WriteEntry, Value: &EntryRecord{ID: assistantID, ConversationID: RootConversationID, Kind: kindAssistant,
+			Model: []agent.Message{{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{{ID: "call1", Name: "search", Arguments: json.RawMessage(`{}`)}}}}}},
+		{Type: WriteTask, Value: &TaskRecord{ID: genID, ConversationID: RootConversationID, Kind: kindGeneration, Version: 1,
+			Input: mustJSON(generationInput{SubmissionID: 0}),
+			State: TaskState{Status: TaskWaiting, Checkpoint: mustJSON(generationCheckpoint{Phase: "tools"}), On: []ID{toolID}}}},
+		{Type: WriteTask, Value: &TaskRecord{ID: toolID, ConversationID: RootConversationID, Kind: kindToolTask, Version: 1,
+			Input: toolInputRaw,
+			State: TaskState{Status: TaskRunning, Checkpoint: toolTaskDef{}.Initial(toolInputRaw)}}},
+	})
+}
+
+// ---- tests ----
+
+func TestSubmitRunsToAnswer(t *testing.T) {
+	ctx := context.Background()
+	llm := &fakeLLM{steps: []llmStep{{resp: agent.Response{Content: "hello there"}}}}
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: llm, SystemPrompt: "sys"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := h.Root().Submit(ctx, SubmitInput{Content: "hi", RequestID: "r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := sub.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != SubmissionDone {
+		t.Fatalf("submission status = %s, want done", rec.Status)
+	}
+	if rec.AnswerID == nil {
+		t.Fatal("submission has no answer entry")
+	}
+	entries, err := h.Root().Entries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Kind != kindUser || entries[1].Kind != kindAssistant {
+		t.Fatalf("entries = %+v, want [user assistant]", entries)
+	}
+	if entries[1].Model[0].Content != "hello there" {
+		t.Fatalf("answer content = %q", entries[1].Model[0].Content)
+	}
+}
+
+func TestSubmitWithToolCall(t *testing.T) {
+	ctx := context.Background()
+	llm := &fakeLLM{steps: []llmStep{
+		{resp: agent.Response{ToolCalls: []agent.ToolCall{{ID: "call1", Name: "search", Arguments: json.RawMessage(`{"q":"x"}`)}}}},
+		{resp: agent.Response{Content: "found it"}},
+	}}
+	tools := &fakeRegistry{
+		specs:   []agent.ToolSpec{{Name: "search", Replay: agent.ReplaySafe}},
+		results: map[string]string{"search": "hit"},
+	}
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: llm, Tools: tools})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := h.Root().Submit(ctx, SubmitInput{Content: "find x", RequestID: "r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := sub.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != SubmissionDone {
+		t.Fatalf("submission status = %s", rec.Status)
+	}
+	if len(tools.calls) != 1 || tools.calls[0] != "search" {
+		t.Fatalf("tool calls = %v", tools.calls)
+	}
+	entries, _ := h.Root().Entries(ctx)
+	if len(entries) != 4 {
+		t.Fatalf("entries = %d, want 4 (user, assistant, tool, assistant)", len(entries))
+	}
+	if entries[2].Kind != kindTool || entries[2].Model[0].Content != "hit" {
+		t.Fatalf("tool entry = %+v", entries[2])
+	}
+	if entries[3].Model[0].Content != "found it" {
+		t.Fatalf("final answer = %q", entries[3].Model[0].Content)
+	}
+}
+
+func TestExactlyOnceRequestID(t *testing.T) {
+	ctx := context.Background()
+	llm := &fakeLLM{steps: []llmStep{
+		{resp: agent.Response{Content: "first"}},
+		{resp: agent.Response{Content: "second"}},
+	}}
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: llm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := h.Root()
+	s1, err := root.Submit(ctx, SubmitInput{Content: "a", RequestID: "job-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := root.Submit(ctx, SubmitInput{Content: "b", RequestID: "job-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s1.ID() != s2.ID() {
+		t.Fatalf("requestId dedup failed: %d != %d", s1.ID(), s2.ID())
+	}
+	rec, err := s1.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != SubmissionDone {
+		t.Fatalf("status = %s", rec.Status)
+	}
+	entries, _ := root.Entries(ctx)
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2 (dedup must not duplicate the user turn)", len(entries))
+	}
+	if llm.calls != 1 {
+		t.Fatalf("llm called %d times, want 1 (dedup must not start a second run)", llm.calls)
+	}
+}
+
+func TestRecoverySafeToolReruns(t *testing.T) {
+	ctx := context.Background()
+	st := NewMemoryStorage()
+	seedCrashedTool(t, st, true)
+
+	llm := &fakeLLM{steps: []llmStep{{resp: agent.Response{Content: "done"}}}}
+	tools := &fakeRegistry{results: map[string]string{"search": "hit"}}
+
+	h, err := Open(ctx, st, HarnessOptions{LLM: llm, Tools: tools})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reconcile already flipped the running tool task to pending with a
+	// restart counted.
+	if err := h.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(tools.calls) != 1 || tools.calls[0] != "search" {
+		t.Fatalf("tool calls = %v, want [search] (safe tool re-runs)", tools.calls)
+	}
+	entries, _ := h.Root().Entries(ctx)
+	if got := toolEntryContent(t, entries); got != "hit" {
+		t.Fatalf("tool entry content = %q, want hit", got)
+	}
+}
+
+func TestRecoveryUnsafeToolReportsInterrupted(t *testing.T) {
+	ctx := context.Background()
+	st := NewMemoryStorage()
+	seedCrashedTool(t, st, false)
+
+	llm := &fakeLLM{steps: []llmStep{{resp: agent.Response{Content: "done"}}}}
+	tools := &fakeRegistry{results: map[string]string{"search": "hit"}}
+
+	h, err := Open(ctx, st, HarnessOptions{LLM: llm, Tools: tools})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(tools.calls) != 0 {
+		t.Fatalf("tool calls = %v, want none (unsafe tool must not re-run)", tools.calls)
+	}
+	entries, _ := h.Root().Entries(ctx)
+	if got := toolEntryContent(t, entries); !strings.Contains(got, "not safe to re-run") {
+		t.Fatalf("tool entry content = %q, want interruption notice", got)
+	}
+}
+
+func TestReconcileMarksRunningPending(t *testing.T) {
+	ctx := context.Background()
+	st := NewMemoryStorage()
+	seedCrashedTool(t, st, true)
+
+	_, err := Open(ctx, st, HarnessOptions{LLM: &fakeLLM{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The running tool task must now be pending with one restart.
+	page, err := st.ScanTasks(ctx, TaskQuery{Kind: kindToolTask}, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("tool tasks = %d", len(page.Items))
+	}
+	task := page.Items[0]
+	if task.State.Status != TaskPending {
+		t.Fatalf("status = %s, want pending", task.State.Status)
+	}
+	if task.Restarts != 1 {
+		t.Fatalf("restarts = %d, want 1", task.Restarts)
+	}
+}
+
+func TestStartStreamsEvents(t *testing.T) {
+	ctx := context.Background()
+	llm := &fakeLLM{steps: []llmStep{
+		{deltas: []string{"go"}, resp: agent.Response{ToolCalls: []agent.ToolCall{{ID: "c1", Name: "search", Arguments: json.RawMessage(`{}`)}}}},
+		{resp: agent.Response{Content: "done"}},
+	}}
+	tools := &fakeRegistry{
+		specs:   []agent.ToolSpec{{Name: "search", Replay: agent.ReplaySafe}},
+		results: map[string]string{"search": "hit"},
+	}
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: llm, Tools: tools})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var events []agent.Event
+	sub, err := h.Start(ctx, StartInput{
+		RequestID:    "r1",
+		SystemPrompt: "sys",
+		Messages:     []agent.Message{{Role: agent.RoleUser, Content: "find"}},
+	}, func(ev agent.Event) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := sub.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != SubmissionDone {
+		t.Fatalf("status = %s, want done", rec.Status)
+	}
+
+	want := []agent.EventType{agent.EventTextDelta, agent.EventToolCall, agent.EventToolResult, agent.EventRunFinished}
+	if len(events) != len(want) {
+		t.Fatalf("events = %d, want %d: %#v", len(events), len(want), events)
+	}
+	for i, w := range want {
+		if events[i].Type != w {
+			t.Fatalf("events[%d].Type = %s, want %s", i, events[i].Type, w)
+		}
+	}
+}
+
+func TestStartExactlyOnceAcrossConversations(t *testing.T) {
+	ctx := context.Background()
+	llm := &fakeLLM{steps: []llmStep{{resp: agent.Response{Content: "a"}}, {resp: agent.Response{Content: "b"}}}}
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: llm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1, err := h.Start(ctx, StartInput{RequestID: "job", Messages: []agent.Message{{Role: agent.RoleUser, Content: "one"}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second request with the same request ID must resolve to the first run.
+	s2, err := h.Start(ctx, StartInput{RequestID: "job", Messages: []agent.Message{{Role: agent.RoleUser, Content: "two"}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s1.ID() != s2.ID() {
+		t.Fatalf("requestId dedup failed across conversations: %d != %d", s1.ID(), s2.ID())
+	}
+	rec, err := s1.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != SubmissionDone {
+		t.Fatalf("status = %s", rec.Status)
+	}
+	if llm.calls != 1 {
+		t.Fatalf("llm calls = %d, want 1", llm.calls)
+	}
+}

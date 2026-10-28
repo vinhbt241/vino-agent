@@ -81,14 +81,21 @@ func New(opts Options) (*Registry, error) {
 // allTools returns the registry's full tool set. Names must be unique.
 func (r *Registry) allTools() []tool {
 	return []tool{
-		{spec: readSpec(), run: r.read},
+		{spec: safe(readSpec()), run: r.read},
 		{spec: writeSpec(), run: r.write},
 		{spec: editSpec(), run: r.edit},
-		{spec: lsSpec(), run: r.ls},
+		{spec: safe(lsSpec()), run: r.ls},
 		{spec: bashSpec(), run: r.bash},
-		{spec: grepSpec(), run: r.grep},
-		{spec: findSpec(), run: r.find},
+		{spec: safe(grepSpec()), run: r.grep},
+		{spec: safe(findSpec()), run: r.find},
 	}
+}
+
+// safe marks a read-only tool's spec as replay-safe after a crash. write,
+// edit, and bash stay unsafe (the zero value).
+func safe(spec agent.ToolSpec) agent.ToolSpec {
+	spec.Replay = agent.ReplaySafe
+	return spec
 }
 
 // Specs implements agent.ToolRegistry. It returns the tool declarations in
