@@ -14,10 +14,11 @@ const defaultAddr = "127.0.0.1:8080"
 
 // Config is the server's startup configuration.
 type Config struct {
-	Addr      string              `json:"addr"`
-	Default   string              `json:"default"`
-	Providers map[string]Provider `json:"providers"`
-	Tools     ToolsConfig         `json:"tools"`
+	Addr        string              `json:"addr"`
+	Default     string              `json:"default"`
+	Providers   map[string]Provider `json:"providers"`
+	Tools       ToolsConfig         `json:"tools"`
+	DurablePath string              `json:"durablePath"`
 }
 
 // Provider is one named LLM provider. APIKey may be empty in the file and
@@ -49,6 +50,9 @@ func LoadConfig(path string) (Config, error) {
 	applyEnv(&cfg)
 	if cfg.Addr == "" {
 		cfg.Addr = defaultAddr
+	}
+	if cfg.DurablePath == "" {
+		cfg.DurablePath = "vino.jsonl"
 	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, err

@@ -1,4 +1,5 @@
 /.scratch/
 .env
 vino.json
+/vino.jsonl
 /workspace/

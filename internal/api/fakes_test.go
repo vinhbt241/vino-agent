@@ -4,9 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"testing"
 
 	"vino/internal/agent"
+	"vino/internal/durable"
 )
+
+// newTestServer wires fake LLM and tools into a Server over an in-memory
+// durable harness, so tests exercise the real run path without a JSONL file.
+func newTestServer(t *testing.T, llm agent.LLM, reg agent.ToolRegistry) *Server {
+	t.Helper()
+	h, err := durable.Open(context.Background(), durable.NewMemoryStorage(), durable.HarnessOptions{LLM: llm, Tools: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newServer(h)
+}
 
 // fakeStep is one scripted LLM turn.
 type fakeStep struct {

@@ -64,6 +64,7 @@ defaulting to `./vino.json`.
 | `providers.<name>.model` | model sent to the provider | *(required)* |
 | `tools.rootDir` | jail root for path-taking tools | process cwd |
 | `tools.workDir` | working dir for shell tools | `tools.rootDir` |
+| `durablePath` | JSONL log the durable harness writes | `vino.jsonl` |
 
 ### Environment overrides
 
@@ -133,7 +134,8 @@ Request body (all fields optional except `messages`):
     { "role": "user", "content": "list the files in the current directory" }
   ],
   "maxIterations": 0,
-  "toolTimeout": "30s"
+  "toolTimeout": "30s",
+  "requestId": "job-42"
 }
 ```
 
@@ -141,6 +143,9 @@ Request body (all fields optional except `messages`):
   server-side.
 - `maxIterations` `0` means the default cap (50).
 - `toolTimeout` is a Go duration string; empty means no timeout.
+- `requestId` (optional) makes a run exactly-once: retrying a request that was
+  cut off by a crash or dropped connection resumes the original run instead of
+  starting a duplicate.
 
 SSE events, in stream order:
 

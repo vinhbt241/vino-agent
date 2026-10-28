@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -45,7 +47,7 @@ func doRun(t *testing.T, s *Server, body string) *httptest.ResponseRecorder {
 }
 
 func TestHealth(t *testing.T) {
-	s := newServer(&fakeLLM{}, &fakeRegistry{})
+	s := newTestServer(t, &fakeLLM{}, &fakeRegistry{})
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -61,7 +63,7 @@ func TestHealth(t *testing.T) {
 
 func TestRun_StreamsTextAndFinish(t *testing.T) {
 	llm := &fakeLLM{steps: []fakeStep{{deltas: []string{"Hel", "lo"}, resp: agent.Response{Content: "Hello"}}}}
-	s := newServer(llm, &fakeRegistry{})
+	s := newTestServer(t, llm, &fakeRegistry{})
 
 	rr := doRun(t, s, `{"systemPrompt":"be brief","messages":[{"role":"user","content":"hi"}]}`)
 
@@ -102,7 +104,7 @@ func TestRun_ToolCallEvents(t *testing.T) {
 		{resp: agent.Response{Content: "done"}},
 	}}
 	reg := &fakeRegistry{result: "file contents"}
-	s := newServer(llm, reg)
+	s := newTestServer(t, llm, reg)
 
 	rr := doRun(t, s, `{"messages":[{"role":"user","content":"read /x"}]}`)
 
@@ -123,7 +125,7 @@ func TestRun_ToolCallEvents(t *testing.T) {
 
 func TestRun_LLMErrorEmitsErrorEvent(t *testing.T) {
 	llm := &fakeLLM{steps: []fakeStep{{err: errors.New("llm down")}}}
-	s := newServer(llm, &fakeRegistry{})
+	s := newTestServer(t, llm, &fakeRegistry{})
 
 	rr := doRun(t, s, `{"messages":[{"role":"user","content":"hi"}]}`)
 
@@ -151,7 +153,7 @@ func TestRun_MaxIterationsEmitsErrorEvent(t *testing.T) {
 		steps[i] = fakeStep{resp: agent.Response{ToolCalls: []agent.ToolCall{{ID: "c", Name: "nop", Arguments: json.RawMessage(`{}`)}}}}
 	}
 	llm := &fakeLLM{steps: steps}
-	s := newServer(llm, &fakeRegistry{result: "ok"})
+	s := newTestServer(t, llm, &fakeRegistry{result: "ok"})
 
 	rr := doRun(t, s, `{"messages":[{"role":"user","content":"go"}],"maxIterations":2}`)
 
@@ -166,7 +168,7 @@ func TestRun_MaxIterationsEmitsErrorEvent(t *testing.T) {
 
 func TestRun_ForwardsMessagesToLLM(t *testing.T) {
 	llm := &fakeLLM{steps: []fakeStep{{resp: agent.Response{Content: "ok"}}}}
-	s := newServer(llm, &fakeRegistry{})
+	s := newTestServer(t, llm, &fakeRegistry{})
 
 	doRun(t, s, `{"systemPrompt":"sys","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]}`)
 
@@ -202,7 +204,7 @@ func TestRun_ValidationErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := newServer(&fakeLLM{}, &fakeRegistry{})
+			s := newTestServer(t, &fakeLLM{}, &fakeRegistry{})
 			rr := doRun(t, s, tt.body)
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400", rr.Code)
@@ -233,5 +235,61 @@ func TestParseTimeout(t *testing.T) {
 				t.Fatalf("parseTimeout(%q) = %v, want %v", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRun_RequestIDDedup(t *testing.T) {
+	llm := &fakeLLM{steps: []fakeStep{{resp: agent.Response{Content: "answer"}}}}
+	s := newTestServer(t, llm, &fakeRegistry{})
+	body := `{"requestId":"job-1","messages":[{"role":"user","content":"hi"}]}`
+
+	rr1 := doRun(t, s, body)
+	rr2 := doRun(t, s, body)
+
+	frames1 := parseSSE(rr1.Body.String())
+	if len(frames1) != 1 || frames1[0].name != "run_finished" {
+		t.Fatalf("first frames = %#v, want [run_finished]", frames1)
+	}
+	frames2 := parseSSE(rr2.Body.String())
+	if len(frames2) != 1 || frames2[0].name != "run_finished" {
+		t.Fatalf("retry frames = %#v, want [run_finished] replayed from storage", frames2)
+	}
+	if !strings.Contains(frames2[0].data, "answer") {
+		t.Fatalf("retry frame data = %q, want stored answer", frames2[0].data)
+	}
+	if len(llm.calls) != 1 {
+		t.Fatalf("llm calls = %d, want 1 (dedup must not start a second run)", len(llm.calls))
+	}
+}
+
+func TestNewServer_WiresDurableStore(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "vino.json")
+	cfg := `{
+		"addr": "127.0.0.1:0",
+		"default": "openai",
+		"providers": {"openai": {"apiKey": "k", "baseURL": "https://example.com/v1", "model": "m"}},
+		"tools": {"rootDir": "` + dir + `", "workDir": "` + dir + `"},
+		"durablePath": "` + filepath.Join(dir, "vino.jsonl") + `"
+	}`
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewServer(loaded)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("health status = %d, want 200", rr.Code)
+	}
+	// The durable log was created.
+	if _, err := os.Stat(loaded.DurablePath); err != nil {
+		t.Fatalf("durable log not created: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"vino/internal/agent"
+	"vino/internal/durable"
 )
 
 // runRequest is the POST /runs body. Provider and model are fixed at server
@@ -17,6 +19,7 @@ type runRequest struct {
 	Messages      []runMessage `json:"messages"`
 	MaxIterations int          `json:"maxIterations"`
 	ToolTimeout   string       `json:"toolTimeout"`
+	RequestID     string       `json:"requestId"`
 }
 
 // runMessage is one incoming conversation turn. Only user/assistant text
@@ -56,25 +59,60 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	input := agent.RunInput{
-		SystemPrompt:  req.SystemPrompt,
-		Messages:      messages,
-		Tools:         s.tools,
-		MaxIterations: req.MaxIterations,
-		ToolTimeout:   timeout,
-	}
-
-	a := agent.Agent{LLM: s.llmClient}
-	_, runErr := a.Run(r.Context(), input, func(ev agent.Event) error {
+	finished := false
+	sink := func(ev agent.Event) error {
+		if ev.Type == agent.EventRunFinished {
+			finished = true
+		}
 		name, data, err := sseEvent(ev)
 		if err != nil {
 			return err
 		}
 		return writeSSE(w, flusher, name, data)
-	})
-	if runErr != nil {
-		_ = writeSSE(w, flusher, "error", map[string]string{"error": runErr.Error()})
 	}
+
+	sub, err := s.harness.Start(r.Context(), durable.StartInput{
+		RequestID:     req.RequestID,
+		SystemPrompt:  req.SystemPrompt,
+		Messages:      messages,
+		MaxIterations: req.MaxIterations,
+		ToolTimeout:   timeout,
+	}, sink)
+	if err != nil {
+		_ = writeSSE(w, flusher, "error", map[string]string{"error": err.Error()})
+		return
+	}
+
+	rec, err := sub.Wait(r.Context())
+	if err != nil {
+		_ = writeSSE(w, flusher, "error", map[string]string{"error": err.Error()})
+		return
+	}
+
+	switch rec.Status {
+	case durable.SubmissionDone:
+		if !finished {
+			// A retry that joined a run which already answered: replay the
+			// terminal event from the stored answer.
+			msg := s.answerMessage(r.Context(), rec)
+			_ = writeSSE(w, flusher, "run_finished", runFinishedDTO{FinalMessage: msg})
+		}
+	case durable.SubmissionUnanswered:
+		_ = writeSSE(w, flusher, "error", map[string]string{"error": rec.Reason})
+	default:
+		_ = writeSSE(w, flusher, "error", map[string]string{"error": "run did not settle"})
+	}
+}
+
+func (s *Server) answerMessage(ctx context.Context, rec *durable.SubmissionRecord) agent.Message {
+	if rec.AnswerID == nil {
+		return agent.Message{}
+	}
+	entry, err := s.harness.Entry(ctx, *rec.AnswerID)
+	if err != nil || entry == nil || len(entry.Model) == 0 {
+		return agent.Message{}
+	}
+	return entry.Model[0]
 }
 
 // writeError sends a non-streaming JSON error response for requests that fail

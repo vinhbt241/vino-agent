@@ -1,25 +1,26 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 
-	"vino/internal/agent"
+	"vino/internal/durable"
 	"vino/internal/llm"
 	"vino/internal/tools"
 )
 
-// Server is the durable-agent HTTP server. It holds no per-request state and
-// is safe for concurrent use as long as its LLM and tool registry are.
+// Server is the durable-agent HTTP server. It routes /health and /runs, and
+// runs every request through a durable harness so runs survive restarts.
 type Server struct {
-	llmClient agent.LLM
-	tools     agent.ToolRegistry
-	mux       *http.ServeMux
+	harness *durable.Harness
+	mux     *http.ServeMux
 }
 
-// NewServer builds a Server from a validated Config, constructing the LLM
-// client for the default provider and the tool registry.
+// NewServer builds a Server from a validated Config: it constructs the LLM
+// client and tool registry, opens a harness over the durable JSONL log, and
+// reconciles any run left mid-flight by a previous process.
 func NewServer(cfg Config) (*Server, error) {
 	p := cfg.Providers[cfg.Default]
 	client, err := llm.New(llm.Config{APIKey: p.APIKey, BaseURL: p.BaseURL, Model: p.Model})
@@ -30,13 +31,26 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("api: tools: %w", err)
 	}
-	return newServer(client, registry), nil
+
+	store, err := durable.OpenJSONL(cfg.DurablePath, false)
+	if err != nil {
+		return nil, fmt.Errorf("api: durable store: %w", err)
+	}
+	harness, err := durable.Open(context.Background(), store, durable.HarnessOptions{
+		LLM:   client,
+		Tools: registry,
+		Model: p.Model,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("api: durable harness: %w", err)
+	}
+	return newServer(harness), nil
 }
 
-// newServer wires an LLM and tool registry into a Server with its routes
-// registered. Exposed as a function so tests can inject fakes.
-func newServer(llmClient agent.LLM, registry agent.ToolRegistry) *Server {
-	s := &Server{llmClient: llmClient, tools: registry}
+// newServer wires a harness into a Server with its routes registered. Exposed
+// as a function so tests can inject a harness over in-memory storage.
+func newServer(harness *durable.Harness) *Server {
+	s := &Server{harness: harness}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("POST /runs", s.handleRun)

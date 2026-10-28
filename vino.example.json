@@ -11,5 +11,6 @@
   "tools": {
     "rootDir": "",
     "workDir": ""
-  }
+  },
+  "durablePath": "vino.jsonl"
 }
