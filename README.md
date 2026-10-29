@@ -65,6 +65,33 @@ defaulting to `./vino.json`.
 | `tools.rootDir` | jail root for path-taking tools | process cwd |
 | `tools.workDir` | working dir for shell tools | `tools.rootDir` |
 | `durablePath` | JSONL log the durable harness writes | `vino.jsonl` |
+| `cors.origins` | allowed origins (`"*"` = any); empty → CORS off | empty (off) |
+| `cors.allowCredentials` | emit `Access-Control-Allow-Credentials` | `false` |
+| `cors.maxAge` | `Access-Control-Max-Age` in seconds | `600` |
+
+### CORS
+
+CORS is **opt-in**. Without a `cors.origins` list the server sends no CORS
+headers and does not handle `OPTIONS` preflights, so cross-origin browser
+clients are blocked as before.
+
+```json
+{
+  "cors": {
+    "origins": ["*"],
+    "allowCredentials": false,
+    "maxAge": 600
+  }
+}
+```
+
+- `origins` accepts `"*"` (any origin) or a list of exact origins such as
+  `["http://localhost:5173"]`. A specific list matches the request's `Origin`
+  and rejects any other origin (or a missing `Origin`) with `403` before the
+  request is handled.
+- `allowCredentials` emits `Access-Control-Allow-Credentials: true`; it cannot
+  be combined with `"*"` (the server refuses to start).
+- `maxAge` caches the preflight answer in the browser.
 
 ### Environment overrides
 
@@ -172,6 +199,10 @@ curl -sN -X POST http://127.0.0.1:8080/runs \
 - Runs have access to the full tool set, including `bash`, `read`, `write`,
   and `edit`, jailed under `tools.rootDir`. Do not bind it to a public
   interface.
+- Enabling CORS with `"*"` while the server is loopback-bound and unauthenticated
+  means **any website you visit can drive the local agent** from your browser
+  (DNS rebinding). Prefer a specific `origins` list, and do not combine `"*"`
+  with a publicly bound address.
 
 ## Development
 

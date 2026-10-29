@@ -15,7 +15,7 @@ import (
 // runs every request through a durable harness so runs survive restarts.
 type Server struct {
 	harness *durable.Harness
-	mux     *http.ServeMux
+	handler http.Handler
 }
 
 // NewServer builds a Server from a validated Config: it constructs the LLM
@@ -44,12 +44,13 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("api: durable harness: %w", err)
 	}
-	return newServer(harness), nil
+	return newServer(harness, cfg.CORS), nil
 }
 
-// newServer wires a harness into a Server with its routes registered. Exposed
-// as a function so tests can inject a harness over in-memory storage.
-func newServer(harness *durable.Harness) *Server {
+// newServer wires a harness into a Server with its routes registered and CORS
+// applied around the mux. Exposed as a function so tests can inject a harness
+// over in-memory storage.
+func newServer(harness *durable.Harness, cors CORSConfig) *Server {
 	s := &Server{harness: harness}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
@@ -57,12 +58,12 @@ func newServer(harness *durable.Harness) *Server {
 	mux.HandleFunc("GET /conversations", s.handleListConversations)
 	mux.HandleFunc("GET /conversations/{id}", s.handleGetConversation)
 	mux.HandleFunc("POST /conversations/{id}/runs", s.handleResumeConversation)
-	s.mux = mux
+	s.handler = corsMiddleware(cors, mux)
 	return s
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.mux.ServeHTTP(w, r)
+	s.handler.ServeHTTP(w, r)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {

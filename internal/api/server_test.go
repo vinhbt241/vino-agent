@@ -389,7 +389,7 @@ func TestRestartRecovery_ResumesInterruptedRun(t *testing.T) {
 	}}
 	reg1 := &blockingRegistry{started: make(chan struct{}), release: make(chan struct{})}
 	h1 := openHarness(t, path, llm1, reg1)
-	s1 := newServer(h1)
+	s1 := newServer(h1, CORSConfig{})
 
 	unwound := make(chan struct{})
 	go func() {
@@ -415,7 +415,7 @@ func TestRestartRecovery_ResumesInterruptedRun(t *testing.T) {
 	llm2 := &fakeLLM{steps: []fakeStep{{resp: agent.Response{Content: "recovered"}}}}
 	reg2 := &fakeRegistry{result: "hit"}
 	h2 := openHarness(t, path, llm2, reg2)
-	s2 := newServer(h2)
+	s2 := newServer(h2, CORSConfig{})
 
 	rr := doRun(t, s2, body)
 	if rr.Code != http.StatusOK {

@@ -129,3 +129,37 @@ func TestLoadConfig_MissingFile(t *testing.T) {
 		t.Fatal("LoadConfig() error = nil, want error")
 	}
 }
+
+func TestLoadConfig_CORS(t *testing.T) {
+	path := writeConfig(t, `{
+		"default": "openai",
+		"providers": {"openai": {"apiKey": "k", "baseURL": "b", "model": "m"}},
+		"cors": {"origins": ["http://localhost:5173"], "allowCredentials": true, "maxAge": 60}
+	}`)
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v, want nil", err)
+	}
+	if len(cfg.CORS.Origins) != 1 || cfg.CORS.Origins[0] != "http://localhost:5173" {
+		t.Fatalf("CORS.Origins = %#v, want [http://localhost:5173]", cfg.CORS.Origins)
+	}
+	if !cfg.CORS.AllowCredentials {
+		t.Fatal("CORS.AllowCredentials = false, want true")
+	}
+	if cfg.CORS.MaxAge != 60 {
+		t.Fatalf("CORS.MaxAge = %d, want 60", cfg.CORS.MaxAge)
+	}
+}
+
+func TestLoadConfig_CORSStarWithCredentialsRejected(t *testing.T) {
+	path := writeConfig(t, `{
+		"default": "openai",
+		"providers": {"openai": {"apiKey": "k", "baseURL": "b", "model": "m"}},
+		"cors": {"origins": ["*"], "allowCredentials": true}
+	}`)
+
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("LoadConfig() error = nil, want error")
+	}
+}

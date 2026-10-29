@@ -273,10 +273,21 @@ for await (const { event, data } of run([{ role: "user", content: "hi" }])) {
 }
 ```
 
-### CORS note
+### CORS
 
-The server does **not** send CORS headers and does not handle `OPTIONS`
-preflight requests. A browser client calling this API cross-origin will be
-blocked by CORS. Serve the web app from the same origin (via a reverse proxy),
-or add CORS handling to the server before pointing a cross-origin browser app
-at it.
+Cross-origin browser calls are supported when the server is configured with a
+CORS policy (see the server README's `cors` config section). When enabled:
+
+- Every response — including the streaming `200` and non-2xx errors — carries
+  `Access-Control-Allow-Origin`.
+- `OPTIONS` preflight requests are answered with `204` plus
+  `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers`, and
+  `Access-Control-Max-Age`. The `/runs` endpoints are `POST` with a JSON body,
+  so browsers send a preflight first; it is answered automatically.
+
+With a specific origin list, requests whose `Origin` is missing or not in the
+list are rejected with `403` before any handler runs.
+
+Without a CORS policy the server sends no CORS headers and does not handle
+`OPTIONS` (preflights fall through to `405`), so cross-origin browsers are
+blocked exactly as before.

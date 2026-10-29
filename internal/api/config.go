@@ -19,6 +19,7 @@ type Config struct {
 	Providers   map[string]Provider `json:"providers"`
 	Tools       ToolsConfig         `json:"tools"`
 	DurablePath string              `json:"durablePath"`
+	CORS        CORSConfig          `json:"cors"`
 }
 
 // Provider is one named LLM provider. APIKey may be empty in the file and
@@ -33,6 +34,16 @@ type Provider struct {
 type ToolsConfig struct {
 	RootDir string `json:"rootDir"`
 	WorkDir string `json:"workDir"`
+}
+
+// CORSConfig configures cross-origin resource sharing. An empty Origins list
+// disables CORS entirely: the server sends no CORS headers and does not answer
+// preflight requests. MaxAge is the Access-Control-Max-Age in seconds; when it
+// is zero and CORS is enabled, the server default applies.
+type CORSConfig struct {
+	Origins          []string `json:"origins"`
+	AllowCredentials bool     `json:"allowCredentials"`
+	MaxAge           int      `json:"maxAge"`
 }
 
 // LoadConfig reads path, merges per-provider env overrides
@@ -93,6 +104,13 @@ func (c Config) validate() error {
 			return fmt.Errorf("api: config: provider %q: baseURL is required", name)
 		case p.Model == "":
 			return fmt.Errorf("api: config: provider %q: model is required", name)
+		}
+	}
+	if c.CORS.AllowCredentials {
+		for _, o := range c.CORS.Origins {
+			if o == "*" {
+				return fmt.Errorf("api: config: cors: origin %q cannot be used with allowCredentials", o)
+			}
 		}
 	}
 	return nil

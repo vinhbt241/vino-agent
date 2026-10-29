@@ -14,11 +14,18 @@ import (
 // durable harness, so tests exercise the real run path without a JSONL file.
 func newTestServer(t *testing.T, llm agent.LLM, reg agent.ToolRegistry) *Server {
 	t.Helper()
+	return newTestServerCORS(t, llm, reg, CORSConfig{})
+}
+
+// newTestServerCORS builds a Server with the given CORS config, over an
+// in-memory harness, so CORS behavior can be tested at the HTTP boundary.
+func newTestServerCORS(t *testing.T, llm agent.LLM, reg agent.ToolRegistry, cors CORSConfig) *Server {
+	t.Helper()
 	h, err := durable.Open(context.Background(), durable.NewMemoryStorage(), durable.HarnessOptions{LLM: llm, Tools: reg})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return newServer(h)
+	return newServer(h, cors)
 }
 
 // openHarness opens a harness over the JSONL log at path, as a server restart
