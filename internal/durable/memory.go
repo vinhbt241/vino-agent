@@ -1,6 +1,9 @@
 package durable
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 // MemoryStorage is the reference Storage backend. It holds records in memory,
 // clones every write and read, and is the semantics every other backend is
@@ -9,6 +12,7 @@ type MemoryStorage struct {
 	ix      *recordIndex
 	nextID  ID
 	nextSeq Seq
+	nextMu  sync.Mutex // guards nextID (minted outside the session's commit lock)
 }
 
 // NewMemoryStorage returns an empty memory backend. The root conversation ID
@@ -32,8 +36,10 @@ func (m *MemoryStorage) MintID(ctx context.Context) (ID, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	m.nextMu.Lock()
 	id := m.nextID
 	m.nextID++
+	m.nextMu.Unlock()
 	return id, nil
 }
 

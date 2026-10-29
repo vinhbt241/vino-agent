@@ -3,9 +3,12 @@ package durable
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"vino/internal/agent"
 )
@@ -49,10 +52,58 @@ type fakeRegistry struct {
 	calls   []string
 }
 
+// blockingLLM signals when its Chat is invoked and blocks until the context
+// is cancelled, mirroring an in-flight model request during a cancel.
+type blockingLLM struct {
+	started chan struct{}
+}
+
+func (b *blockingLLM) Chat(ctx context.Context, _ []agent.Message, _ []agent.ToolSpec, _ func(string) error) (agent.Response, error) {
+	close(b.started)
+	<-ctx.Done()
+	return agent.Response{}, ctx.Err()
+}
+
 func (f *fakeRegistry) Specs() []agent.ToolSpec { return f.specs }
 func (f *fakeRegistry) Call(_ context.Context, name string, _ json.RawMessage) (string, error) {
 	f.calls = append(f.calls, name)
 	return f.results[name], nil
+}
+
+// blockingRegistry signals when its tool starts and blocks until released,
+// used to hold a run in flight while another submission is admitted.
+type blockingRegistry struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingRegistry) Specs() []agent.ToolSpec {
+	return []agent.ToolSpec{{Name: "block", Replay: agent.ReplaySafe}}
+}
+
+func (b *blockingRegistry) Call(_ context.Context, name string, _ json.RawMessage) (string, error) {
+	b.started <- struct{}{}
+	<-b.release
+	return "released", nil
+}
+
+// cancelAwareRegistry blocks in its tool until the context is cancelled, then
+// reports the cancellation — like a real tool (e.g. bash sleep) killed by a
+// request cancellation.
+type cancelAwareRegistry struct {
+	started  chan struct{}
+	released chan struct{}
+}
+
+func (c *cancelAwareRegistry) Specs() []agent.ToolSpec {
+	return []agent.ToolSpec{{Name: "block", Replay: agent.ReplaySafe}}
+}
+
+func (c *cancelAwareRegistry) Call(ctx context.Context, name string, _ json.RawMessage) (string, error) {
+	close(c.started)
+	<-ctx.Done()
+	close(c.released)
+	return "", ctx.Err()
 }
 
 // ---- helpers ----
@@ -375,5 +426,336 @@ func TestStartExactlyOnceAcrossConversations(t *testing.T) {
 	}
 	if llm.calls != 1 {
 		t.Fatalf("llm calls = %d, want 1", llm.calls)
+	}
+}
+
+func TestSinkDisconnectDoesNotAbortRun(t *testing.T) {
+	ctx := context.Background()
+	llm := &fakeLLM{steps: []llmStep{
+		{resp: agent.Response{ToolCalls: []agent.ToolCall{{ID: "c1", Name: "search", Arguments: json.RawMessage(`{}`)}}}},
+		{resp: agent.Response{Content: "done"}},
+	}}
+	tools := &fakeRegistry{
+		specs:   []agent.ToolSpec{{Name: "search", Replay: agent.ReplaySafe}},
+		results: map[string]string{"search": "hit"},
+	}
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: llm, Tools: tools})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the client disconnecting right as the tool result is emitted.
+	// The run must keep going and persist a consistent transcript.
+	sink := func(ev agent.Event) error {
+		if ev.Type == agent.EventToolResult {
+			return errors.New("client disconnected")
+		}
+		return nil
+	}
+	sub, err := h.Root().SubmitStream(ctx, SubmitInput{Content: "find x", RequestID: "r1"}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := sub.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != SubmissionDone {
+		t.Fatalf("status = %s, want done (sink failure must not abort the run)", rec.Status)
+	}
+
+	entries, err := h.Root().Entries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("entries = %d, want 4 (user, assistant, tool, assistant)", len(entries))
+	}
+	if entries[2].Kind != kindTool || entries[2].Model[0].Content != "hit" {
+		t.Fatalf("tool entry = %+v, want a committed tool result", entries[2])
+	}
+	if entries[3].Model[0].Content != "done" {
+		t.Fatalf("final answer = %q, want done", entries[3].Model[0].Content)
+	}
+}
+
+func TestConcurrentSubmitQueuesBehindInFlightRun(t *testing.T) {
+	ctx := context.Background()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	tools := &blockingRegistry{started: started, release: release}
+	llm := &fakeLLM{steps: []llmStep{
+		{resp: agent.Response{ToolCalls: []agent.ToolCall{{ID: "c1", Name: "block", Arguments: json.RawMessage(`{}`)}}}},
+		{resp: agent.Response{Content: "first done"}},
+		{resp: agent.Response{Content: "second done"}},
+	}}
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: llm, Tools: tools})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wait := func(sub *Submission) chan error {
+		ch := make(chan error, 1)
+		go func() {
+			rec, err := sub.Wait(ctx)
+			if err != nil {
+				ch <- err
+				return
+			}
+			if rec.Status != SubmissionDone {
+				ch <- fmt.Errorf("status = %s, want done", rec.Status)
+				return
+			}
+			ch <- nil
+		}()
+		return ch
+	}
+
+	sub1, err := h.Root().Submit(ctx, SubmitInput{Content: "first", RequestID: "r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDone := wait(sub1)
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first run never reached its tool")
+	}
+
+	sub2, err := h.Root().Submit(ctx, SubmitInput{Content: "second", RequestID: "r2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDone := wait(sub2)
+
+	// The second run must not settle while the first is still executing.
+	select {
+	case <-secondDone:
+		t.Fatal("second submission completed while the first run was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+
+	for i, ch := range []chan error{firstDone, secondDone} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("run %d: %v", i+1, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("run %d timed out", i+1)
+		}
+	}
+
+	entries, err := h.Root().Entries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 6 {
+		t.Fatalf("entries = %d, want 6 (user, assistant, tool, assistant, user, assistant)", len(entries))
+	}
+}
+
+func TestCancelAbortsToolAndSettlesRun(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	released := make(chan struct{})
+	tools := &cancelAwareRegistry{started: started, released: released}
+	llm := &fakeLLM{steps: []llmStep{
+		{resp: agent.Response{ToolCalls: []agent.ToolCall{{ID: "c1", Name: "block", Arguments: json.RawMessage(`{}`)}}}},
+		{resp: agent.Response{Content: "after cancel"}},
+	}}
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: llm, Tools: tools})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := h.Root().Submit(ctx, SubmitInput{Content: "do it", RequestID: "r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCh := make(chan *SubmissionRecord, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		rec, err := sub.Wait(ctx)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		waitCh <- rec
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tool never started")
+	}
+
+	cancel()
+
+	select {
+	case <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tool never observed cancellation")
+	}
+
+	var rec *SubmissionRecord
+	select {
+	case rec = <-waitCh:
+	case err := <-errCh:
+		t.Fatalf("Wait: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait never returned")
+	}
+
+	if rec.Status != SubmissionUnanswered {
+		t.Fatalf("status = %s, want unanswered (cancelled)", rec.Status)
+	}
+	if rec.Reason != "run cancelled by client" {
+		t.Fatalf("reason = %q, want %q", rec.Reason, "run cancelled by client")
+	}
+
+	ctx2 := context.Background()
+	entries, err := h.Root().Entries(ctx2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("entries = %d, want 3 (user, assistant, tool)", len(entries))
+	}
+	if entries[2].Kind != kindTool || entries[2].Model[0].Content != abortedToolResult {
+		t.Fatalf("tool entry = %+v, want cancelled tool result", entries[2])
+	}
+
+	// A subsequent prompt must build a valid context from the aborted run.
+	sub2, err := h.Root().Submit(ctx2, SubmitInput{Content: "now what", RequestID: "r2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec2, err := sub2.Wait(ctx2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec2.Status != SubmissionDone {
+		t.Fatalf("second status = %s, want done", rec2.Status)
+	}
+	if llm.calls != 2 {
+		t.Fatalf("llm calls = %d, want 2", llm.calls)
+	}
+}
+
+func TestCancelDuringModelCallAborts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	llm := &blockingLLM{started: make(chan struct{})}
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: llm})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := h.Root().Submit(ctx, SubmitInput{Content: "hi", RequestID: "r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCh := make(chan *SubmissionRecord, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		rec, err := sub.Wait(ctx)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		waitCh <- rec
+	}()
+
+	select {
+	case <-llm.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("model call never started")
+	}
+
+	cancel()
+
+	var rec *SubmissionRecord
+	select {
+	case rec = <-waitCh:
+	case err := <-errCh:
+		t.Fatalf("Wait: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait never returned")
+	}
+
+	if rec.Status != SubmissionUnanswered {
+		t.Fatalf("status = %s, want unanswered (cancelled)", rec.Status)
+	}
+
+	// No assistant entry was committed, so the transcript stays valid and the
+	// conversation can be resumed.
+	entries, err := h.Root().Entries(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Kind != kindUser {
+		t.Fatalf("entries = %+v, want a single user entry", entries)
+	}
+}
+
+func TestSanitizeToolCalls(t *testing.T) {
+	toolCall := agent.ToolCall{ID: "c1", Name: "search", Arguments: json.RawMessage(`{}`)}
+	cases := []struct {
+		name string
+		in   []agent.Message
+		want []agent.Message
+	}{
+		{
+			name: "well formed unchanged",
+			in: []agent.Message{
+				{Role: agent.RoleUser, Content: "find"},
+				{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{toolCall}},
+				{Role: agent.RoleTool, ToolCallID: "c1", Name: "search", Content: "hit"},
+				{Role: agent.RoleAssistant, Content: "done"},
+			},
+			want: []agent.Message{
+				{Role: agent.RoleUser, Content: "find"},
+				{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{toolCall}},
+				{Role: agent.RoleTool, ToolCallID: "c1", Name: "search", Content: "hit"},
+				{Role: agent.RoleAssistant, Content: "done"},
+			},
+		},
+		{
+			name: "dangling tool call gets placeholder",
+			in: []agent.Message{
+				{Role: agent.RoleUser, Content: "find"},
+				{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{toolCall}},
+				{Role: agent.RoleUser, Content: "what are you doing"},
+			},
+			want: []agent.Message{
+				{Role: agent.RoleUser, Content: "find"},
+				{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{toolCall}},
+				{Role: agent.RoleTool, ToolCallID: "c1", Name: "search", Content: cancelledToolResult},
+				{Role: agent.RoleUser, Content: "what are you doing"},
+			},
+		},
+		{
+			name: "orphan tool message dropped",
+			in: []agent.Message{
+				{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{toolCall}},
+				{Role: agent.RoleTool, ToolCallID: "other", Name: "search", Content: "stale"},
+				{Role: agent.RoleUser, Content: "next"},
+			},
+			want: []agent.Message{
+				{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{toolCall}},
+				{Role: agent.RoleTool, ToolCallID: "c1", Name: "search", Content: cancelledToolResult},
+				{Role: agent.RoleUser, Content: "next"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeToolCalls(tc.in); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("sanitizeToolCalls() = %#v, want %#v", got, tc.want)
+			}
+		})
 	}
 }

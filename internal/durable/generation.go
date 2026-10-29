@@ -17,6 +17,11 @@ const (
 	kindToolTask   = "vino.tool"
 )
 
+// abortedToolResult is the tool result recorded when the client cancels the
+// stream mid-tool-call: the action is aborted but the transcript keeps a
+// valid tool message so the provider's tool-call schema stays satisfied.
+const abortedToolResult = "tool call was cancelled by the client"
+
 // generationInput is the generation task's durable input.
 type generationInput struct {
 	SubmissionID  ID     `json:"submissionId"`
@@ -44,6 +49,11 @@ func (generationTask) Initial(input json.RawMessage) json.RawMessage {
 }
 
 func (g generationTask) Step(ctx context.Context, checkpoint json.RawMessage, rt *TaskRuntime) (NextState, error) {
+	if rt.AbortRequested() {
+		var in generationInput
+		_ = json.Unmarshal(rt.Input(), &in)
+		return g.abort(rt, in.SubmissionID), nil
+	}
 	var cp generationCheckpoint
 	if len(checkpoint) > 0 {
 		if err := json.Unmarshal(checkpoint, &cp); err != nil {
@@ -78,7 +88,7 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 		return NextState{}, agent.ErrMaxIterations
 	}
 
-	messages, err := h.buildMessages(ctx, rt.ConversationID(), in.SystemPrompt)
+	messages, err := h.buildMessages(rt.Ctx(), rt.ConversationID(), in.SystemPrompt)
 	if err != nil {
 		return NextState{}, err
 	}
@@ -89,14 +99,18 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 	}
 
 	onDelta := func(delta string) error {
-		return h.emit(in.SubmissionID, agent.Event{Type: agent.EventTextDelta, TextDelta: &agent.TextDelta{Text: delta}})
+		h.emit(in.SubmissionID, agent.Event{Type: agent.EventTextDelta, TextDelta: &agent.TextDelta{Text: delta}})
+		return nil
 	}
 	resp, err := h.llm.Chat(ctx, messages, specs, onDelta)
 	if err != nil {
+		if ctx.Err() != nil {
+			return g.abort(rt, in.SubmissionID), nil
+		}
 		return NextState{}, err
 	}
 
-	assistantID, err := rt.MintID(ctx)
+	assistantID, err := rt.MintID()
 	if err != nil {
 		return NextState{}, err
 	}
@@ -109,10 +123,8 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 			Kind:           kindAssistant,
 			Model:          []agent.Message{final},
 		})
-		settleSubmission(ctx, rt, in.SubmissionID, assistantID)
-		if err := h.emit(in.SubmissionID, agent.Event{Type: agent.EventRunFinished, RunFinished: &agent.RunFinishedEvent{FinalMessage: final}}); err != nil {
-			return NextState{}, err
-		}
+		settleSubmission(rt, in.SubmissionID, assistantID)
+		h.emit(in.SubmissionID, agent.Event{Type: agent.EventRunFinished, RunFinished: &agent.RunFinishedEvent{FinalMessage: final}})
 		h.unregisterSink(in.SubmissionID)
 		return NextState{
 			Status:  TaskTerminal,
@@ -132,10 +144,8 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 
 	children := make([]ID, 0, len(resp.ToolCalls))
 	for _, tc := range resp.ToolCalls {
-		if err := h.emit(in.SubmissionID, agent.Event{Type: agent.EventToolCall, ToolCall: &agent.ToolCallEvent{ID: tc.ID, Name: tc.Name, Arguments: tc.Arguments}}); err != nil {
-			return NextState{}, err
-		}
-		taskID, err := rt.MintID(ctx)
+		h.emit(in.SubmissionID, agent.Event{Type: agent.EventToolCall, ToolCall: &agent.ToolCallEvent{ID: tc.ID, Name: tc.Name, Arguments: tc.Arguments}})
+		taskID, err := rt.MintID()
 		if err != nil {
 			return NextState{}, err
 		}
@@ -168,11 +178,11 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 
 // settleSubmission marks the answered submission done, pointing at the
 // assistant entry that answered it.
-func settleSubmission(ctx context.Context, rt *TaskRuntime, submissionID ID, answerID ID) {
+func settleSubmission(rt *TaskRuntime, submissionID ID, answerID ID) {
 	if submissionID == 0 {
 		return
 	}
-	sub, err := rt.Submission(ctx, submissionID)
+	sub, err := rt.Submission(submissionID)
 	if err != nil || sub == nil {
 		return
 	}
@@ -180,6 +190,15 @@ func settleSubmission(ctx context.Context, rt *TaskRuntime, submissionID ID, ans
 	updated.Status = SubmissionDone
 	updated.AnswerID = &answerID
 	rt.AppendSubmission(&updated)
+}
+
+// abort settles the submission as unanswered and ends the generation task
+// with an aborted outcome, without calling the model again.
+func (g generationTask) abort(rt *TaskRuntime, submissionID ID) NextState {
+	if submissionID != 0 {
+		rt.Harness().settleUnanswered(rt.Ctx(), submissionID, "run cancelled by client")
+	}
+	return NextState{Status: TaskTerminal, Outcome: &Outcome{Status: OutcomeAborted}}
 }
 
 // toolInput is the tool task's durable input.
@@ -214,7 +233,7 @@ func (toolTaskDef) Step(ctx context.Context, checkpoint json.RawMessage, rt *Tas
 		defer cancel()
 	}
 
-	entryID, err := rt.MintID(ctx)
+	entryID, err := rt.MintID()
 	if err != nil {
 		return NextState{}, err
 	}
@@ -225,10 +244,15 @@ func (toolTaskDef) Step(ctx context.Context, checkpoint json.RawMessage, rt *Tas
 		evResult = content
 	} else {
 		result, callErr := rt.Harness().tools.Call(ctx, in.Name, in.Arguments)
-		if callErr != nil {
+		switch {
+		case ctx.Err() != nil:
+			content = abortedToolResult
+			evErr = content
+			markOwnerAborted(rt)
+		case callErr != nil:
 			content = callErr.Error()
 			evErr = callErr.Error()
-		} else {
+		default:
 			content = result
 			evResult = result
 		}
@@ -245,13 +269,27 @@ func (toolTaskDef) Step(ctx context.Context, checkpoint json.RawMessage, rt *Tas
 			Content:    content,
 		}},
 	})
-	if err := rt.Harness().emit(in.SubmissionID, agent.Event{Type: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{ID: in.CallID, Name: in.Name, Result: evResult, Error: evErr}}); err != nil {
-		return NextState{}, err
-	}
+	rt.Harness().emit(in.SubmissionID, agent.Event{Type: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{ID: in.CallID, Name: in.Name, Result: evResult, Error: evErr}})
 	return NextState{
 		Status:  TaskTerminal,
 		Outcome: &Outcome{Status: OutcomeCompleted, Result: mustJSON(content)},
 	}, nil
+}
+
+// markOwnerAborted flags the generation task that spawned this tool task so
+// that, once the scheduler resumes it, it settles the run aborted instead of
+// continuing to the model.
+func markOwnerAborted(rt *TaskRuntime) {
+	ownerID := rt.OwnerID()
+	if ownerID == nil {
+		return
+	}
+	owner, err := rt.Task(*ownerID)
+	if err != nil || owner == nil || owner.AbortRequested {
+		return
+	}
+	owner.AbortRequested = true
+	rt.AppendTask(owner)
 }
 
 func replayOf(tools agent.ToolRegistry, name string) agent.ReplayMode {

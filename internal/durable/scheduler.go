@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"sync"
 )
 
 // Scheduler reserves pending tasks, invokes their definitions off the mutation
@@ -13,6 +14,8 @@ type Scheduler struct {
 	session *Session
 	harness *Harness
 	defs    map[string]TaskDefinition
+
+	runMu sync.Mutex
 }
 
 // NewScheduler builds a scheduler over a session for the given definitions.
@@ -44,20 +47,29 @@ func (sch *Scheduler) Reconcile(ctx context.Context) error {
 
 // Run drives every pending task to a terminal or waiting state, resuming
 // waiting tasks whose child tasks have finished. It returns when the harness
-// is idle.
+// is idle. Concurrent calls are serialized: a request that arrives while a
+// run is still executing queues behind it instead of racing the same tasks.
 func (sch *Scheduler) Run(ctx context.Context) error {
+	sch.runMu.Lock()
+	defer sch.runMu.Unlock()
+
+	// Execution ctx stays cancellable so a client cancel aborts tools and
+	// model calls. Storage ctx is detached: the scheduler must still commit
+	// the settled state and any partial results after the request is gone.
+	durableCtx := context.WithoutCancel(ctx)
+
 	for {
-		if err := sch.resumeWaiting(ctx); err != nil {
+		if err := sch.resumeWaiting(durableCtx); err != nil {
 			return err
 		}
-		task, err := sch.nextPending(ctx)
+		task, err := sch.nextPending(durableCtx)
 		if err != nil {
 			return err
 		}
 		if task == nil {
 			return nil
 		}
-		if err := sch.runOne(ctx, task); err != nil {
+		if err := sch.runOne(ctx, durableCtx, task); err != nil {
 			return err
 		}
 	}
@@ -112,21 +124,22 @@ func allTerminal(ctx context.Context, tx *Tx, ids []ID) (bool, error) {
 }
 
 // runOne reserves a pending task, then repeatedly steps it until it reaches a
-// terminal or waiting state.
-func (sch *Scheduler) runOne(ctx context.Context, task *TaskRecord) error {
+// terminal or waiting state. execCtx aborts execution on cancel; durableCtx
+// persists progress.
+func (sch *Scheduler) runOne(execCtx, durableCtx context.Context, task *TaskRecord) error {
 	def := sch.defs[task.Kind]
 	if def == nil {
-		return sch.fault(ctx, task, "missing task definition "+task.Kind)
+		return sch.fault(durableCtx, task, "missing task definition "+task.Kind)
 	}
 
 	// Reserve: pending -> running, checkpoint preserved. This is the durable
 	// intent that a crash re-invokes.
-	if err := sch.commitState(ctx, task, TaskRunning, task.State.Checkpoint, nil, nil); err != nil {
+	if err := sch.commitState(durableCtx, task, TaskRunning, task.State.Checkpoint, nil, nil); err != nil {
 		return err
 	}
 
 	for {
-		cur, err := sch.session.storage.Task(ctx, task.ID)
+		cur, err := sch.session.storage.Task(durableCtx, task.ID)
 		if err != nil {
 			return err
 		}
@@ -134,14 +147,14 @@ func (sch *Scheduler) runOne(ctx context.Context, task *TaskRecord) error {
 			return nil
 		}
 
-		rt := &TaskRuntime{session: sch.session, harness: sch.harness, task: cur}
-		next, err := def.Step(ctx, cur.State.Checkpoint, rt)
+		rt := &TaskRuntime{session: sch.session, harness: sch.harness, task: cur, ctx: durableCtx}
+		next, err := def.Step(execCtx, cur.State.Checkpoint, rt)
 		if err != nil {
-			return sch.fault(ctx, cur, err.Error())
+			return sch.fault(durableCtx, cur, err.Error())
 		}
 
 		writes := append([]StorageWrite(nil), rt.writes...)
-		if err := sch.commitState(ctx, cur, next.Status, next.Checkpoint, next.On, next.Outcome, writes...); err != nil {
+		if err := sch.commitState(durableCtx, cur, next.Status, next.Checkpoint, next.On, next.Outcome, writes...); err != nil {
 			return err
 		}
 
@@ -150,11 +163,11 @@ func (sch *Scheduler) runOne(ctx context.Context, task *TaskRecord) error {
 			return nil
 		case TaskRunning, TaskPending:
 			if noProgress(cur.State.Checkpoint, next.Checkpoint, rt.writes) {
-				return sch.fault(ctx, cur, "task step made no durable progress")
+				return sch.fault(durableCtx, cur, "task step made no durable progress")
 			}
 			continue
 		default:
-			return sch.fault(ctx, cur, "unknown next status "+string(next.Status))
+			return sch.fault(durableCtx, cur, "unknown next status "+string(next.Status))
 		}
 	}
 }

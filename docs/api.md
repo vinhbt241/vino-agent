@@ -187,9 +187,14 @@ For a completed run `role` is always `"assistant"` and `tool_calls` is empty.
 | `404` | Unknown path, unknown conversation, or the internal root conversation (`1`) | `{"error":"..."}` (for conversation lookups) |
 | `405` | Wrong HTTP method | (Go `ServeMux` response with an `Allow` header) |
 
-Runtime failures (provider unreachable, max iterations exceeded, tool error
-that aborts the run, client disconnect) do **not** use an HTTP error status —
-they are reported as a final SSE `error` event on the `200` stream.
+Runtime failures (provider unreachable, max iterations exceeded, or a tool
+error that aborts the run) do **not** use an HTTP error status — they are
+reported as a final SSE `error` event on the `200` stream.
+
+A client disconnect (e.g. the Stop button aborts the fetch) aborts the run's
+execution: any in-flight tool call is cancelled and recorded in the transcript
+as a cancelled tool result, and the run settles with an `error` event. The
+transcript stays consistent, so the conversation can still be resumed.
 
 ## Full example transcript
 

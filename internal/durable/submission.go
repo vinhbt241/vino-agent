@@ -27,7 +27,9 @@ func (s *Submission) Wait(ctx context.Context) (*SubmissionRecord, error) {
 	if err := s.h.scheduler.Run(ctx); err != nil {
 		return nil, err
 	}
-	return s.h.session.storage.Submission(ctx, s.rec.ID)
+	// Read the settled record detached from the request context: the run may
+	// have been cancelled (ctx done) yet still settled durably.
+	return s.h.session.storage.Submission(context.WithoutCancel(ctx), s.rec.ID)
 }
 
 // SubmitInput is a user input submission.

@@ -32,7 +32,11 @@ type TaskRuntime struct {
 	session *Session
 	harness *Harness
 	task    *TaskRecord
-	writes  []StorageWrite
+	// ctx is the durable context for storage operations. It is detached from
+	// the request lifetime so a client cancel can abort execution (the Step's
+	// own ctx) without preventing the run from persisting its settled state.
+	ctx    context.Context
+	writes []StorageWrite
 }
 
 func (rt *TaskRuntime) TaskID() ID             { return rt.task.ID }
@@ -40,25 +44,28 @@ func (rt *TaskRuntime) ConversationID() ID     { return rt.task.ConversationID }
 func (rt *TaskRuntime) Input() json.RawMessage { return rt.task.Input }
 func (rt *TaskRuntime) Restarts() int          { return rt.task.Restarts }
 func (rt *TaskRuntime) Harness() *Harness      { return rt.harness }
+func (rt *TaskRuntime) Ctx() context.Context   { return rt.ctx }
+func (rt *TaskRuntime) OwnerID() *ID           { return rt.task.OwnerID }
+func (rt *TaskRuntime) AbortRequested() bool   { return rt.task.AbortRequested }
 
-func (rt *TaskRuntime) MintID(ctx context.Context) (ID, error) {
-	return rt.session.storage.MintID(ctx)
+func (rt *TaskRuntime) MintID() (ID, error) {
+	return rt.session.storage.MintID(rt.ctx)
 }
 
-func (rt *TaskRuntime) Entry(ctx context.Context, id ID) (*EntryRecord, error) {
-	return rt.session.storage.Entry(ctx, id)
+func (rt *TaskRuntime) Entry(id ID) (*EntryRecord, error) {
+	return rt.session.storage.Entry(rt.ctx, id)
 }
 
-func (rt *TaskRuntime) Task(ctx context.Context, id ID) (*TaskRecord, error) {
-	return rt.session.storage.Task(ctx, id)
+func (rt *TaskRuntime) Task(id ID) (*TaskRecord, error) {
+	return rt.session.storage.Task(rt.ctx, id)
 }
 
-func (rt *TaskRuntime) Submission(ctx context.Context, id ID) (*SubmissionRecord, error) {
-	return rt.session.storage.Submission(ctx, id)
+func (rt *TaskRuntime) Submission(id ID) (*SubmissionRecord, error) {
+	return rt.session.storage.Submission(rt.ctx, id)
 }
 
-func (rt *TaskRuntime) ScanEntries(ctx context.Context, q EntryQuery) (*Page[EntryRecord], error) {
-	return rt.session.storage.ScanEntries(ctx, q, 0, nil)
+func (rt *TaskRuntime) ScanEntries(q EntryQuery) (*Page[EntryRecord], error) {
+	return rt.session.storage.ScanEntries(rt.ctx, q, 0, nil)
 }
 
 // AppendEntry stages an entry write for the step's atomic commit.

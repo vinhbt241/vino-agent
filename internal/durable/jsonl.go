@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 )
 
 // JSONLStorage persists records to a single append-only JSONL file: one line
@@ -19,6 +20,7 @@ type JSONLStorage struct {
 	ix      *recordIndex
 	nextID  ID
 	nextSeq Seq
+	nextMu  sync.Mutex // guards nextID (minted outside the session's commit lock)
 	path    string
 	f       *os.File
 	fsync   bool
@@ -206,8 +208,10 @@ func (j *JSONLStorage) MintID(ctx context.Context) (ID, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	j.nextMu.Lock()
 	id := j.nextID
 	j.nextID++
+	j.nextMu.Unlock()
 	return id, nil
 }
 

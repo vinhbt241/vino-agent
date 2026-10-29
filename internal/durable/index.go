@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 )
 
 // recordIndex is the shared in-memory record store behind MemoryStorage and
 // JSONLStorage. It enforces immutability and clone-on-read so neither backend
 // can alias commit arguments into its tables.
 type recordIndex struct {
+	mu sync.RWMutex // guards all maps: commits take write, reads take read
+
 	conversations map[ID]*ConversationRecord
 	entries       map[ID]*EntryRecord
 	tasks         map[ID]*TaskRecord
@@ -31,11 +34,13 @@ func newRecordIndex() *recordIndex {
 // apply validates one commit batch without mutating, then stores it. The two
 // phases are split so a batch that fails validation never partially applies.
 func (ix *recordIndex) apply(writes []StorageWrite) error {
-	if err := ix.validate(writes); err != nil {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	if err := ix.validateLocked(writes); err != nil {
 		return err
 	}
 	for _, w := range writes {
-		ix.store(w)
+		ix.storeLocked(w)
 	}
 	return nil
 }
@@ -43,6 +48,12 @@ func (ix *recordIndex) apply(writes []StorageWrite) error {
 // validate checks the whole batch before any store. It makes the same checks
 // store relies on, so store itself cannot fail.
 func (ix *recordIndex) validate(writes []StorageWrite) error {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	return ix.validateLocked(writes)
+}
+
+func (ix *recordIndex) validateLocked(writes []StorageWrite) error {
 	for _, w := range writes {
 		switch w.Type {
 		case WriteConversation:
@@ -95,9 +106,10 @@ func (ix *recordIndex) validate(writes []StorageWrite) error {
 	return nil
 }
 
-// store applies one already-validated write, cloning values so later caller
-// mutation cannot reach stored state.
-func (ix *recordIndex) store(w StorageWrite) {
+// storeLocked applies one already-validated write, cloning values so later
+// caller mutation cannot reach stored state. Callers must hold ix.mu for
+// writing.
+func (ix *recordIndex) storeLocked(w StorageWrite) {
 	switch w.Type {
 	case WriteConversation:
 		rec := w.Value.(*ConversationRecord)
@@ -173,6 +185,8 @@ func reverse[T any](s []T) {
 // ---- reads ----
 
 func (ix *recordIndex) conversation(id ID) *ConversationRecord {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
 	if rec, ok := ix.conversations[id]; ok {
 		return clone(rec)
 	}
@@ -180,6 +194,8 @@ func (ix *recordIndex) conversation(id ID) *ConversationRecord {
 }
 
 func (ix *recordIndex) entry(id ID) *EntryRecord {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
 	if rec, ok := ix.entries[id]; ok {
 		return clone(rec)
 	}
@@ -187,6 +203,8 @@ func (ix *recordIndex) entry(id ID) *EntryRecord {
 }
 
 func (ix *recordIndex) task(id ID) *TaskRecord {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
 	if rec, ok := ix.tasks[id]; ok {
 		return clone(rec)
 	}
@@ -194,6 +212,8 @@ func (ix *recordIndex) task(id ID) *TaskRecord {
 }
 
 func (ix *recordIndex) submission(id ID) *SubmissionRecord {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
 	if rec, ok := ix.submissions[id]; ok {
 		return clone(rec)
 	}
@@ -201,6 +221,8 @@ func (ix *recordIndex) submission(id ID) *SubmissionRecord {
 }
 
 func (ix *recordIndex) submissionByRequest(requestID string) *SubmissionRecord {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
 	if rec, ok := ix.reqIndex[requestID]; ok {
 		return clone(rec)
 	}
@@ -210,6 +232,8 @@ func (ix *recordIndex) submissionByRequest(requestID string) *SubmissionRecord {
 // ---- scans ----
 
 func (ix *recordIndex) scanConversations(q ConversationQuery, limit int, cursor *Cursor) *Page[ConversationRecord] {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
 	var items []ConversationRecord
 	for _, rec := range ix.conversations {
 		if q.ExcludeRoot && rec.ID == RootConversationID {
@@ -228,6 +252,8 @@ func (ix *recordIndex) scanConversations(q ConversationQuery, limit int, cursor 
 }
 
 func (ix *recordIndex) scanEntries(q EntryQuery, limit int, cursor *Cursor) *Page[EntryRecord] {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
 	var items []EntryRecord
 	for _, rec := range ix.entries {
 		if rec.ConversationID != q.ConversationID {
@@ -246,6 +272,8 @@ func (ix *recordIndex) scanEntries(q EntryQuery, limit int, cursor *Cursor) *Pag
 }
 
 func (ix *recordIndex) scanTasks(q TaskQuery, limit int, cursor *Cursor) *Page[TaskRecord] {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
 	var items []TaskRecord
 	for _, rec := range ix.tasks {
 		if q.ConversationID != nil && rec.ConversationID != *q.ConversationID {
@@ -267,6 +295,8 @@ func (ix *recordIndex) scanTasks(q TaskQuery, limit int, cursor *Cursor) *Page[T
 }
 
 func (ix *recordIndex) scanSubmissions(q SubmissionQuery, limit int, cursor *Cursor) *Page[SubmissionRecord] {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
 	var items []SubmissionRecord
 	for _, rec := range ix.submissions {
 		if q.ConversationID != nil && rec.ConversationID != *q.ConversationID {

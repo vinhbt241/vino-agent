@@ -154,6 +154,9 @@ func (s *Server) streamSubmission(w http.ResponseWriter, r *http.Request, create
 		return
 	}
 
+	// A client cancel (Stop) aborts execution — tools and model calls see the
+	// request context cancelled — while the scheduler persists a consistent,
+	// settled transcript (in-flight tool calls are recorded as cancelled).
 	rec, err := sub.Wait(r.Context())
 	if err != nil {
 		_ = writeSSE(w, flusher, "error", map[string]string{"error": err.Error()})
