@@ -166,6 +166,37 @@ func TestChat_MapsMessagesToWire(t *testing.T) {
 	}
 }
 
+func TestChat_EmitsContentForEmptyToolResult(t *testing.T) {
+	var rawBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	client, err := New(Config{APIKey: "k", BaseURL: srv.URL, Model: "m"})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	msgs := []agent.Message{
+		{Role: agent.RoleUser, Content: "clean up"},
+		{Role: agent.RoleAssistant, Content: "", ToolCalls: []agent.ToolCall{{ID: "c1", Name: "bash", Arguments: json.RawMessage(`{"command":"rm -rf x"}`)}}},
+		{Role: agent.RoleTool, ToolCallID: "c1", Name: "bash", Content: ""},
+	}
+	if _, err := client.Chat(context.Background(), msgs, nil, func(string) error { return nil }); err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+
+	// DeepSeek and other strict OpenAI-compatible providers reject requests
+	// where a tool (or tool-call-only assistant) message omits the content key.
+	// The raw request body must contain "content":"" for empty tool results.
+	if !strings.Contains(string(rawBody), `"content":""`) {
+		t.Fatalf("request body missing empty content field: %s", rawBody)
+	}
+}
+
 func TestChat_IncludesToolsInRequest(t *testing.T) {
 	var gotReq chatRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
