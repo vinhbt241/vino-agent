@@ -46,6 +46,9 @@ type Harness struct {
 
 	sinkMu sync.Mutex
 	sinks  map[ID]agent.EventSink
+
+	abortMu     sync.Mutex
+	abortCancel map[ID]context.CancelFunc
 }
 
 // resolveRestartLimit maps HarnessOptions.RestartLimit onto a concrete limit:
@@ -78,6 +81,7 @@ func Open(ctx context.Context, storage Storage, opts HarnessOptions) (*Harness, 
 		defs:         defs,
 		restartLimit: resolveRestartLimit(opts.RestartLimit),
 		sinks:        make(map[ID]agent.EventSink),
+		abortCancel:  make(map[ID]context.CancelFunc),
 	}
 	h.scheduler = NewScheduler(session, h, defs)
 
@@ -116,9 +120,34 @@ func (h *Harness) Root() *Conversation {
 	return &Conversation{h: h, id: RootConversationID}
 }
 
-// Run drives every pending task to completion and returns when idle.
+// Run drives every conversation with pending work to completion and returns
+// when idle, running different conversations concurrently.
 func (h *Harness) Run(ctx context.Context) error {
-	return h.scheduler.Run(ctx)
+	return h.scheduler.RunAll(ctx)
+}
+
+// registerAbort records the cancel func of a conversation's active run so
+// Conversation.Abort can interrupt it. Serialized per conversation by the
+// scheduler's conversation lock, so at most one run is registered at a time.
+func (h *Harness) registerAbort(conversationID ID, cancel context.CancelFunc) {
+	h.abortMu.Lock()
+	h.abortCancel[conversationID] = cancel
+	h.abortMu.Unlock()
+}
+
+func (h *Harness) unregisterAbort(conversationID ID) {
+	h.abortMu.Lock()
+	delete(h.abortCancel, conversationID)
+	h.abortMu.Unlock()
+}
+
+func (h *Harness) cancelAbort(conversationID ID) {
+	h.abortMu.Lock()
+	cancel := h.abortCancel[conversationID]
+	h.abortMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // Close closes the harness's storage backend.

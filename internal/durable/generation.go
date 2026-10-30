@@ -137,6 +137,13 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 		return NextState{}, err
 	}
 
+	// A concurrent Conversation.Abort may have committed its mark while the
+	// model call was in flight, before its cancellation reached the call:
+	// discard the answer instead of committing it over an aborted run.
+	if cur, err := rt.Task(rt.TaskID()); err == nil && cur != nil && cur.AbortRequested {
+		return g.abort(rt, in.SubmissionID, "")
+	}
+
 	assistantID, err := rt.MintID()
 	if err != nil {
 		return NextState{}, err
@@ -233,6 +240,9 @@ func settleSubmission(rt *TaskRuntime, submissionID ID, answerID ID) {
 	sub, err := rt.Submission(submissionID)
 	if err != nil || sub == nil {
 		return
+	}
+	if sub.Status == SubmissionDone || sub.Status == SubmissionUnanswered {
+		return // already settled: a concurrent abort wins over a late answer
 	}
 	updated := *sub
 	updated.Status = SubmissionDone

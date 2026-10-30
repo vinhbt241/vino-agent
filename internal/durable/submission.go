@@ -24,9 +24,10 @@ func (s *Submission) ConversationID() ID { return s.rec.ConversationID }
 // an already-admitted submission) rather than being newly created.
 func (s *Submission) Resumed() bool { return s.resumed }
 
-// Wait drives the harness to idle and returns the settled submission record.
+// Wait drives the submission's conversation to idle and returns the settled
+// submission record.
 func (s *Submission) Wait(ctx context.Context) (*SubmissionRecord, error) {
-	if err := s.h.scheduler.Run(ctx); err != nil {
+	if err := s.h.scheduler.RunConversation(ctx, s.rec.ConversationID); err != nil {
 		return nil, err
 	}
 	// Read the settled record detached from the request context: the run may
@@ -202,6 +203,46 @@ func (c *Conversation) SubmitStream(ctx context.Context, in SubmitInput, sink ag
 	}
 	c.h.registerSink(sub.ID, sink)
 	return &Submission{h: c.h, rec: sub, resumed: resumed}, nil
+}
+
+// Abort marks every foreground task in the conversation aborted, settles any
+// open submissions unanswered, and cancels the conversation's in-flight run
+// (its tools and model calls observe the cancellation). Settling is idempotent,
+// so a marked generation's own settle later is a no-op.
+func (c *Conversation) Abort(ctx context.Context) error {
+	if err := c.h.session.Commit(ctx, func(tx *Tx) error {
+		page, err := tx.ScanTasks(ctx, TaskQuery{ConversationID: &c.id})
+		if err != nil {
+			return err
+		}
+		for i := range page.Items {
+			t := page.Items[i]
+			if t.Background || t.State.Status == TaskTerminal || t.State.Status == TaskCompleting {
+				continue
+			}
+			t.AbortRequested = true
+			tx.WriteTask(&t)
+		}
+
+		subs, err := tx.ScanSubmissions(ctx, SubmissionQuery{ConversationID: &c.id})
+		if err != nil {
+			return err
+		}
+		for i := range subs.Items {
+			s := subs.Items[i]
+			if s.Status == SubmissionDone || s.Status == SubmissionUnanswered {
+				continue
+			}
+			s.Status = SubmissionUnanswered
+			s.Reason = "aborted"
+			tx.WriteSubmission(&s)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	c.h.cancelAbort(c.id)
+	return nil
 }
 
 // Entries returns the conversation's entries in ID order (the raw transcript).

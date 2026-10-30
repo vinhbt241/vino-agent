@@ -10,13 +10,15 @@ import (
 
 // Scheduler reserves pending tasks, invokes their definitions off the mutation
 // line, commits each step's durable progress, and reconciles running tasks
-// back to pending on open. Slice 1 runs tasks serially.
+// back to pending on open. It schedules per conversation: runs in different
+// conversations proceed concurrently, runs in the same conversation serialize.
 type Scheduler struct {
 	session *Session
 	harness *Harness
 	defs    map[string]TaskDefinition
 
-	runMu sync.Mutex
+	convMu    sync.Mutex
+	convLocks map[ID]*sync.Mutex
 }
 
 // NewScheduler builds a scheduler over a session for the given definitions.
@@ -25,7 +27,20 @@ func NewScheduler(session *Session, harness *Harness, defs []TaskDefinition) *Sc
 	for _, d := range defs {
 		m[d.Kind()] = d
 	}
-	return &Scheduler{session: session, harness: harness, defs: m}
+	return &Scheduler{session: session, harness: harness, defs: m, convLocks: make(map[ID]*sync.Mutex)}
+}
+
+// lockFor returns the mutex serializing a conversation's runs, creating it on
+// first use.
+func (sch *Scheduler) lockFor(id ID) *sync.Mutex {
+	sch.convMu.Lock()
+	defer sch.convMu.Unlock()
+	if l, ok := sch.convLocks[id]; ok {
+		return l
+	}
+	l := &sync.Mutex{}
+	sch.convLocks[id] = l
+	return l
 }
 
 // Reconcile marks every surviving running task as pending and counts the
@@ -46,38 +61,83 @@ func (sch *Scheduler) Reconcile(ctx context.Context) error {
 	})
 }
 
-// Run drives every pending task to a terminal or waiting state, resuming
-// waiting tasks whose child tasks have finished. It returns when the harness
-// is idle. Concurrent calls are serialized: a request that arrives while a
-// run is still executing queues behind it instead of racing the same tasks.
-func (sch *Scheduler) Run(ctx context.Context) error {
-	sch.runMu.Lock()
-	defer sch.runMu.Unlock()
+// RunConversation drives one conversation's tasks to idle, serializing with
+// other runs of the same conversation and running concurrently with other
+// conversations. Execution ctx stays cancellable so a client cancel (or
+// Conversation.Abort) aborts tools and model calls; background tasks run under
+// a detached ctx so a foreground cancel leaves them alone. The storage ctx is
+// detached so the scheduler still commits settled state after the request is
+// gone.
+func (sch *Scheduler) RunConversation(ctx context.Context, conversationID ID) error {
+	lock := sch.lockFor(conversationID)
+	lock.Lock()
+	defer lock.Unlock()
 
-	// Execution ctx stays cancellable so a client cancel aborts tools and
-	// model calls. Storage ctx is detached: the scheduler must still commit
-	// the settled state and any partial results after the request is gone.
+	execCtx, cancel := context.WithCancel(ctx)
+	sch.harness.registerAbort(conversationID, cancel)
+	defer func() {
+		cancel()
+		sch.harness.unregisterAbort(conversationID)
+	}()
+
 	durableCtx := context.WithoutCancel(ctx)
-
 	for {
-		if err := sch.resumeWaiting(durableCtx); err != nil {
+		if err := sch.resumeWaiting(durableCtx, conversationID); err != nil {
 			return err
 		}
-		task, err := sch.nextPending(durableCtx)
+		task, err := sch.nextPending(durableCtx, conversationID)
 		if err != nil {
 			return err
 		}
 		if task == nil {
 			return nil
 		}
-		if err := sch.runOne(ctx, durableCtx, task); err != nil {
+		taskCtx := execCtx
+		if task.Background {
+			taskCtx = context.WithoutCancel(ctx)
+		}
+		if err := sch.runOne(taskCtx, durableCtx, task); err != nil {
 			return err
 		}
 	}
 }
 
-func (sch *Scheduler) nextPending(ctx context.Context) (*TaskRecord, error) {
-	page, err := sch.session.storage.ScanTasks(ctx, TaskQuery{Status: TaskPending, Order: OrderAscending}, 1, nil)
+// RunAll drives every conversation with work to idle, running different
+// conversations concurrently and waiting for all of them.
+func (sch *Scheduler) RunAll(ctx context.Context) error {
+	page, err := sch.session.storage.ScanTasks(ctx, TaskQuery{}, 0, nil)
+	if err != nil {
+		return err
+	}
+	convs := make(map[ID]bool)
+	for _, t := range page.Items {
+		if t.State.Status != TaskTerminal {
+			convs[t.ConversationID] = true
+		}
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	for id := range convs {
+		wg.Add(1)
+		go func(id ID) {
+			defer wg.Done()
+			if err := sch.RunConversation(ctx, id); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+			}
+		}(id)
+	}
+	wg.Wait()
+	return firstErr
+}
+
+func (sch *Scheduler) nextPending(ctx context.Context, conversationID ID) (*TaskRecord, error) {
+	page, err := sch.session.storage.ScanTasks(ctx, TaskQuery{ConversationID: &conversationID, Status: TaskPending, Order: OrderAscending}, 1, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -90,9 +150,9 @@ func (sch *Scheduler) nextPending(ctx context.Context) (*TaskRecord, error) {
 
 // resumeWaiting flips a waiting task back to pending once every task it waits
 // on is terminal.
-func (sch *Scheduler) resumeWaiting(ctx context.Context) error {
+func (sch *Scheduler) resumeWaiting(ctx context.Context, conversationID ID) error {
 	return sch.session.Commit(ctx, func(tx *Tx) error {
-		page, err := tx.ScanTasks(ctx, TaskQuery{Status: TaskWaiting})
+		page, err := tx.ScanTasks(ctx, TaskQuery{Status: TaskWaiting, ConversationID: &conversationID})
 		if err != nil {
 			return err
 		}

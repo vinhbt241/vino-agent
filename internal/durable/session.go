@@ -112,6 +112,11 @@ func (tx *Tx) ScanConversations(ctx context.Context, q ConversationQuery) (*Page
 	return tx.session.storage.ScanConversations(ctx, q, 0, nil)
 }
 
+// ScanSubmissions reads all submissions matching q (limit 0 means no bound).
+func (tx *Tx) ScanSubmissions(ctx context.Context, q SubmissionQuery) (*Page[SubmissionRecord], error) {
+	return tx.session.storage.ScanSubmissions(ctx, q, 0, nil)
+}
+
 func (tx *Tx) WriteConversation(rec *ConversationRecord) {
 	tx.writes = append(tx.writes, StorageWrite{Type: WriteConversation, Value: rec})
 }
