@@ -61,6 +61,9 @@ func (g generationTask) Step(ctx context.Context, checkpoint json.RawMessage, rt
 		_ = json.Unmarshal(rt.Input(), &in)
 		return g.abort(rt, in.SubmissionID, "")
 	}
+	if rt.Restarts() >= rt.Harness().restartLimit {
+		return g.endCutOff(rt, checkpoint)
+	}
 	var cp generationCheckpoint
 	if len(checkpoint) > 0 {
 		if err := json.Unmarshal(checkpoint, &cp); err != nil {
@@ -200,6 +203,27 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 	}, nil
 }
 
+// endCutOff ends a generation cut off restartLimit times: it settles the
+// submission unanswered and fails the task, never calling the model again.
+func (g generationTask) endCutOff(rt *TaskRuntime, checkpoint json.RawMessage) (NextState, error) {
+	var cp generationCheckpoint
+	_ = json.Unmarshal(checkpoint, &cp)
+	phase := cp.Phase
+	if phase == "" {
+		phase = "model"
+	}
+	msg := fmt.Sprintf("The generation was interrupted %s in its %s phase", cutOffCount(rt.Restarts()), phase)
+	var in generationInput
+	_ = json.Unmarshal(rt.Input(), &in)
+	if in.SubmissionID != 0 {
+		rt.Harness().settleUnanswered(rt.Ctx(), in.SubmissionID, msg)
+	}
+	return NextState{
+		Status:  TaskTerminal,
+		Outcome: &Outcome{Status: OutcomeFailed, Error: &OutcomeError{Message: msg}},
+	}, nil
+}
+
 // settleSubmission marks the answered submission done, pointing at the
 // assistant entry that answered it.
 func settleSubmission(rt *TaskRuntime, submissionID ID, answerID ID) {
@@ -266,6 +290,14 @@ func (toolTaskDef) Step(ctx context.Context, checkpoint json.RawMessage, rt *Tas
 		return NextState{}, err
 	}
 
+	if rt.AbortRequested() {
+		return abortToolResult(rt, in)
+	}
+
+	if rt.Restarts() >= rt.Harness().restartLimit {
+		return toolRestartLimitResult(rt, in)
+	}
+
 	if in.TimeoutMs > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(in.TimeoutMs)*time.Millisecond)
@@ -287,7 +319,7 @@ func (toolTaskDef) Step(ctx context.Context, checkpoint json.RawMessage, rt *Tas
 		case ctx.Err() != nil:
 			content = abortedToolResult
 			evErr = content
-			markOwnerAborted(rt)
+			rt.markAbortCascade()
 		case callErr != nil:
 			content = callErr.Error()
 			evErr = callErr.Error()
@@ -315,20 +347,63 @@ func (toolTaskDef) Step(ctx context.Context, checkpoint json.RawMessage, rt *Tas
 	}, nil
 }
 
-// markOwnerAborted flags the generation task that spawned this tool task so
-// that, once the scheduler resumes it, it settles the run aborted instead of
-// continuing to the model.
-func markOwnerAborted(rt *TaskRuntime) {
-	ownerID := rt.OwnerID()
-	if ownerID == nil {
-		return
+// cutOffCount renders a restart count for interruption messages: "once", or
+// "<n> times in a row".
+func cutOffCount(restarts int) string {
+	if restarts == 1 {
+		return "once"
 	}
-	owner, err := rt.Task(*ownerID)
-	if err != nil || owner == nil || owner.AbortRequested {
-		return
+	return fmt.Sprintf("%d times in a row", restarts)
+}
+
+// toolRestartLimitResult ends a tool task that was cut off restartLimit times:
+// it writes an error result the model sees and fails the task, never running
+// the tool again.
+func toolRestartLimitResult(rt *TaskRuntime, in toolInput) (NextState, error) {
+	entryID, err := rt.MintID()
+	if err != nil {
+		return NextState{}, err
 	}
-	owner.AbortRequested = true
-	rt.AppendTask(owner)
+	msg := fmt.Sprintf("Tool %s was interrupted %s; it is not run again", in.Name, cutOffCount(rt.Restarts()))
+	rt.AppendEntry(&EntryRecord{
+		ID:             entryID,
+		ConversationID: rt.ConversationID(),
+		Kind:           kindTool,
+		Model: []agent.Message{{
+			Role:       agent.RoleTool,
+			ToolCallID: in.CallID,
+			Name:       in.Name,
+			Content:    msg,
+		}},
+	})
+	rt.Harness().emit(in.SubmissionID, agent.Event{Type: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{ID: in.CallID, Name: in.Name, Error: msg}})
+	return NextState{
+		Status:  TaskTerminal,
+		Outcome: &Outcome{Status: OutcomeFailed, Error: &OutcomeError{Message: msg}},
+	}, nil
+}
+
+// abortToolResult settles a tool task marked aborted without running its
+// effect, recording a valid tool result so the transcript stays consistent
+// for the next run's context.
+func abortToolResult(rt *TaskRuntime, in toolInput) (NextState, error) {
+	entryID, err := rt.MintID()
+	if err != nil {
+		return NextState{}, err
+	}
+	rt.AppendEntry(&EntryRecord{
+		ID:             entryID,
+		ConversationID: rt.ConversationID(),
+		Kind:           kindTool,
+		Model: []agent.Message{{
+			Role:       agent.RoleTool,
+			ToolCallID: in.CallID,
+			Name:       in.Name,
+			Content:    abortedToolResult,
+		}},
+	})
+	rt.Harness().emit(in.SubmissionID, agent.Event{Type: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{ID: in.CallID, Name: in.Name, Error: abortedToolResult}})
+	return NextState{Status: TaskTerminal, Outcome: &Outcome{Status: OutcomeAborted}}, nil
 }
 
 func replayOf(tools agent.ToolRegistry, name string) agent.ReplayMode {

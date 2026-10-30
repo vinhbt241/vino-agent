@@ -10,6 +10,11 @@ import (
 	"vino/internal/agent"
 )
 
+// defaultRestartLimit is the number of consecutive crashes after which a task
+// ends itself instead of running again. Values <= 0 on HarnessOptions resolve
+// to this default.
+const defaultRestartLimit = 5
+
 // HarnessOptions wires a harness to the application's model, tools, and any
 // additional task definitions.
 type HarnessOptions struct {
@@ -21,6 +26,10 @@ type HarnessOptions struct {
 	// Models maps names to model clients for per-conversation selection via
 	// AgentConfig.Model. Unnamed or unknown models fall back to LLM.
 	Models map[string]agent.LLM
+	// RestartLimit is the number of consecutive crashes after which a task
+	// ends itself instead of running again. Values <= 0 resolve to the
+	// default (5).
+	RestartLimit int
 }
 
 // Harness is the host-facing facade over a Session and Scheduler.
@@ -33,9 +42,19 @@ type Harness struct {
 	systemPrompt string
 	models       map[string]agent.LLM
 	defs         []TaskDefinition
+	restartLimit int
 
 	sinkMu sync.Mutex
 	sinks  map[ID]agent.EventSink
+}
+
+// resolveRestartLimit maps HarnessOptions.RestartLimit onto a concrete limit:
+// a positive value is honored, anything else (zero, negative) is the default.
+func resolveRestartLimit(limit int) int {
+	if limit >= 1 {
+		return limit
+	}
+	return defaultRestartLimit
 }
 
 // Open opens a harness over a storage backend, ensures the root conversation
@@ -57,6 +76,7 @@ func Open(ctx context.Context, storage Storage, opts HarnessOptions) (*Harness, 
 		systemPrompt: opts.SystemPrompt,
 		models:       opts.Models,
 		defs:         defs,
+		restartLimit: resolveRestartLimit(opts.RestartLimit),
 		sinks:        make(map[ID]agent.EventSink),
 	}
 	h.scheduler = NewScheduler(session, h, defs)

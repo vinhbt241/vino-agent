@@ -87,6 +87,55 @@ func (rt *TaskRuntime) AppendSubmission(rec *SubmissionRecord) {
 	rt.writes = append(rt.writes, StorageWrite{Type: WriteSubmission, Value: rec})
 }
 
+// markAbortCascade stages abort marks for the whole foreground ownership tree
+// the current task belongs to: it walks up OwnerID to the topmost foreground
+// owner, then walks down marking every live, non-background descendant. The
+// marks commit atomically with the step's own outcome, so a crash between the
+// abort and a descendant's settle does not re-run that descendant's effect.
+func (rt *TaskRuntime) markAbortCascade() {
+	root := rt.task.ID
+	for {
+		t, err := rt.Task(root)
+		if err != nil || t == nil || t.OwnerID == nil {
+			break
+		}
+		parent, err := rt.Task(*t.OwnerID)
+		if err != nil || parent == nil || parent.Background {
+			break
+		}
+		root = *t.OwnerID
+	}
+	rt.markTree(root)
+}
+
+// markTree marks a task and its live foreground descendants as aborted,
+// skipping background subtrees (which ordinary abort leaves alone) and tasks
+// already marked or terminal. The current task handles its own settle, so it
+// is skipped.
+func (rt *TaskRuntime) markTree(id ID) {
+	t, err := rt.Task(id)
+	if err != nil || t == nil {
+		return
+	}
+	if t.State.Status == TaskTerminal || t.State.Status == TaskCompleting {
+		return
+	}
+	if t.Background {
+		return // background tasks and everything below them are not reached
+	}
+	if id != rt.task.ID && !t.AbortRequested {
+		t.AbortRequested = true
+		rt.AppendTask(t)
+	}
+	page, err := rt.session.storage.ScanTasks(rt.ctx, TaskQuery{OwnerID: &id}, 0, nil)
+	if err != nil {
+		return
+	}
+	for _, child := range page.Items {
+		rt.markTree(child.ID)
+	}
+}
+
 func mustJSON(v any) json.RawMessage {
 	b, err := json.Marshal(v)
 	if err != nil {

@@ -60,6 +60,7 @@ type EntryQuery struct {
 // TaskQuery filters a task scan.
 type TaskQuery struct {
 	ConversationID *ID
+	OwnerID        *ID
 	Kind           string
 	Status         TaskStatus
 	Background     *bool

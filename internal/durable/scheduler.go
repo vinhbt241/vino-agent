@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 )
 
@@ -132,6 +133,13 @@ func (sch *Scheduler) runOne(execCtx, durableCtx context.Context, task *TaskReco
 		return sch.fault(durableCtx, task, "missing task definition "+task.Kind)
 	}
 
+	// A task cut off restartLimit times ends at reservation: built-in kinds
+	// end themselves in their phase (nicer result), any other kind is faulted
+	// here before its phase runs.
+	if !sch.limitsRestarts(task.Kind) && task.Restarts >= sch.harness.restartLimit {
+		return sch.fault(durableCtx, task, fmt.Sprintf("Task %d (%s) was cut off %d times without progress", task.ID, task.Kind, task.Restarts))
+	}
+
 	// Reserve: pending -> running, checkpoint preserved. This is the durable
 	// intent that a crash re-invokes.
 	if err := sch.commitState(durableCtx, task, TaskRunning, task.State.Checkpoint, nil, nil); err != nil {
@@ -180,8 +188,38 @@ func noProgress(oldCheckpoint, newCheckpoint []byte, writes []StorageWrite) bool
 func (sch *Scheduler) commitState(ctx context.Context, cur *TaskRecord, status TaskStatus, checkpoint json.RawMessage, on []ID, outcome *Outcome, writes ...StorageWrite) error {
 	updated := *cur
 	updated.State = TaskState{Status: status, Checkpoint: checkpoint, On: on, Outcome: outcome}
+	// Real progress (a new checkpoint, a wait, or an outcome) removes the
+	// crash count, so the limit is "in a row"; the reservation commit
+	// (pending -> running, same checkpoint) is not progress.
+	if isProgress(cur, status, checkpoint) {
+		updated.Restarts = 0
+	}
 	writes = append(writes, StorageWrite{Type: WriteTask, Value: &updated})
 	return sch.session.CommitWrites(ctx, writes)
+}
+
+// isProgress reports whether a committed state counts as durable progress: a
+// changed checkpoint, or a transition to waiting/completing/terminal.
+func isProgress(cur *TaskRecord, status TaskStatus, checkpoint json.RawMessage) bool {
+	if !bytes.Equal(cur.State.Checkpoint, checkpoint) {
+		return true
+	}
+	switch status {
+	case TaskWaiting, TaskCompleting, TaskTerminal:
+		return true
+	}
+	return false
+}
+
+// limitsRestarts reports whether a task kind ends itself once cut off
+// restartLimit times (the built-in tasks); the scheduler faults any other kind
+// at reservation instead.
+func (sch *Scheduler) limitsRestarts(kind string) bool {
+	switch kind {
+	case kindGeneration, kindToolTask:
+		return true
+	}
+	return false
 }
 
 // fault writes a terminal faulted outcome, preserving the task record, then

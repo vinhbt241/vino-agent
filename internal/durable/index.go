@@ -276,6 +276,9 @@ func (ix *recordIndex) scanTasks(q TaskQuery, limit int, cursor *Cursor) *Page[T
 		if q.ConversationID != nil && rec.ConversationID != *q.ConversationID {
 			continue
 		}
+		if q.OwnerID != nil && (rec.OwnerID == nil || *rec.OwnerID != *q.OwnerID) {
+			continue
+		}
 		if q.Kind != "" && rec.Kind != q.Kind {
 			continue
 		}
