@@ -106,7 +106,7 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 		systemPrompt = conv.Agent.SystemPrompt
 	}
 
-	messages, err := h.buildMessages(rt.Ctx(), rt.ConversationID(), systemPrompt)
+	messages, err := h.contextMessages(rt.Ctx(), rt.ConversationID(), systemPrompt)
 	if err != nil {
 		return NextState{}, err
 	}

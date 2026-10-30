@@ -16,48 +16,6 @@ const (
 	defaultCompactInstructions = "Summarize the conversation above, preserving important facts, decisions, actions taken, and open questions. Be concise but complete."
 )
 
-// latestCompaction returns the conversation's most recent compaction entry
-// (largest ID), or nil when there is none.
-func (h *Harness) latestCompaction(ctx context.Context, conversationID ID) (*EntryRecord, error) {
-	page, err := h.session.storage.ScanEntries(ctx, EntryQuery{ConversationID: conversationID, Order: OrderDescending}, 0, nil)
-	if err != nil {
-		return nil, err
-	}
-	for i := range page.Items {
-		if page.Items[i].Kind == kindCompaction {
-			e := page.Items[i]
-			return &e, nil
-		}
-	}
-	return nil, nil
-}
-
-// liveTail returns the entries the model still sees verbatim — everything
-// after the latest compaction's head, excluding compaction entries — together
-// with the latest compaction entry itself (nil when none). Without a
-// compaction entry the tail is the whole transcript.
-func (h *Harness) liveTail(ctx context.Context, conversationID ID) ([]EntryRecord, *EntryRecord, error) {
-	comp, err := h.latestCompaction(ctx, conversationID)
-	if err != nil {
-		return nil, nil, err
-	}
-	page, err := h.session.storage.ScanEntries(ctx, EntryQuery{ConversationID: conversationID, Order: OrderAscending}, 0, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	tail := make([]EntryRecord, 0, len(page.Items))
-	for _, e := range page.Items {
-		if e.Kind == kindCompaction {
-			continue
-		}
-		if comp != nil && comp.Head != nil && e.ID <= *comp.Head {
-			continue
-		}
-		tail = append(tail, e)
-	}
-	return tail, comp, nil
-}
-
 // Compact summarizes the conversation so far into a durable compaction entry.
 // instructions become the system prompt for the summarization call. Compacting
 // an empty (or already fully summarized) conversation is a no-op. The older
