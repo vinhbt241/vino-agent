@@ -307,7 +307,7 @@ func (h *Harness) buildMessages(ctx context.Context, conversationID ID, systemPr
 	for _, e := range tail {
 		msgs = append(msgs, e.Model...)
 	}
-	return sanitizeToolCalls(msgs), nil
+	return assembleToolTurns(msgs), nil
 }
 
 // ancestorEntries returns the raw (non-compaction) entries from the
@@ -409,58 +409,6 @@ func (f toolFilter) Specs() []agent.ToolSpec {
 
 func (f toolFilter) Call(ctx context.Context, name string, args json.RawMessage) (string, error) {
 	return f.base.Call(ctx, name, args)
-}
-
-// cancelledToolResult is the placeholder tool result written when an assistant
-// tool-call turn has no matching tool result in the transcript (a run was
-// cancelled or crashed after the assistant turn committed but before the tool
-// results landed). It keeps the model context valid for providers that reject
-// an assistant tool_calls message not followed by a tool message per call.
-const cancelledToolResult = "tool call was cancelled before it completed"
-
-// sanitizeToolCalls ensures every assistant message carrying tool_calls is
-// followed by exactly one tool message per call. Tool messages that do not
-// answer any call are dropped, and missing results are filled with a
-// placeholder, so the returned message list always satisfies the provider's
-// tool-call message schema.
-func sanitizeToolCalls(msgs []agent.Message) []agent.Message {
-	out := make([]agent.Message, 0, len(msgs))
-	for i := 0; i < len(msgs); i++ {
-		m := msgs[i]
-		if m.Role != agent.RoleAssistant || len(m.ToolCalls) == 0 {
-			out = append(out, m)
-			continue
-		}
-
-		out = append(out, m)
-		want := make(map[string]bool, len(m.ToolCalls))
-		for _, tc := range m.ToolCalls {
-			want[tc.ID] = true
-		}
-
-		j := i + 1
-		for j < len(msgs) && msgs[j].Role == agent.RoleTool {
-			tm := msgs[j]
-			if want[tm.ToolCallID] {
-				out = append(out, tm)
-				delete(want, tm.ToolCallID)
-			}
-			j++
-		}
-
-		for _, tc := range m.ToolCalls {
-			if want[tc.ID] {
-				out = append(out, agent.Message{
-					Role:       agent.RoleTool,
-					ToolCallID: tc.ID,
-					Name:       tc.Name,
-					Content:    cancelledToolResult,
-				})
-			}
-		}
-		i = j - 1
-	}
-	return out
 }
 
 // ---- event sinks ----

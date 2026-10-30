@@ -24,11 +24,6 @@ type assistantEntryData struct {
 	Aborted bool `json:"aborted,omitempty"`
 }
 
-// abortedToolResult is the tool result recorded when the client cancels the
-// stream mid-tool-call: the action is aborted but the transcript keeps a
-// valid tool message so the provider's tool-call schema stays satisfied.
-const abortedToolResult = "tool call was cancelled by the client"
-
 // generationInput is the generation task's durable input.
 type generationInput struct {
 	SubmissionID  ID     `json:"submissionId"`
@@ -151,12 +146,7 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 
 	if len(resp.ToolCalls) == 0 {
 		final := agent.Message{Role: agent.RoleAssistant, Content: resp.Content}
-		rt.AppendEntry(&EntryRecord{
-			ID:             assistantID,
-			ConversationID: rt.ConversationID(),
-			Kind:           kindAssistant,
-			Model:          []agent.Message{final},
-		})
+		appendAssistantEntry(rt, assistantID, final, nil)
 		settleSubmission(rt, in.SubmissionID, assistantID)
 		h.emit(in.SubmissionID, agent.Event{Type: agent.EventRunFinished, RunFinished: &agent.RunFinishedEvent{FinalMessage: final}})
 		h.unregisterSink(in.SubmissionID)
@@ -169,12 +159,7 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 	// Commit the assistant turn (with tool calls) and one child tool task per
 	// call, then wait for them.
 	assistant := agent.Message{Role: agent.RoleAssistant, Content: resp.Content, ToolCalls: resp.ToolCalls}
-	rt.AppendEntry(&EntryRecord{
-		ID:             assistantID,
-		ConversationID: rt.ConversationID(),
-		Kind:           kindAssistant,
-		Model:          []agent.Message{assistant},
-	})
+	appendAssistantEntry(rt, assistantID, assistant, nil)
 
 	children := make([]ID, 0, len(resp.ToolCalls))
 	for _, tc := range resp.ToolCalls {
@@ -260,13 +245,7 @@ func (g generationTask) abort(rt *TaskRuntime, submissionID ID, partial string) 
 		if err != nil {
 			return NextState{}, err
 		}
-		rt.AppendEntry(&EntryRecord{
-			ID:             entryID,
-			ConversationID: rt.ConversationID(),
-			Kind:           kindAssistant,
-			Model:          []agent.Message{{Role: agent.RoleAssistant, Content: partial}},
-			Data:           mustJSON(assistantEntryData{Aborted: true}),
-		})
+		appendAssistantEntry(rt, entryID, agent.Message{Role: agent.RoleAssistant, Content: partial}, mustJSON(assistantEntryData{Aborted: true}))
 	}
 	if submissionID != 0 {
 		rt.Harness().settleUnanswered(rt.Ctx(), submissionID, "run cancelled by client")
@@ -321,7 +300,7 @@ func (toolTaskDef) Step(ctx context.Context, checkpoint json.RawMessage, rt *Tas
 
 	var content, evResult, evErr string
 	if rt.Restarts() > 0 && !in.ReplaySafe {
-		content = "tool call was interrupted by a crash and is not safe to re-run"
+		content = crashInterruptedToolResult
 		evResult = content
 	} else {
 		result, callErr := rt.Harness().tools.Call(ctx, in.Name, in.Arguments)
@@ -339,17 +318,7 @@ func (toolTaskDef) Step(ctx context.Context, checkpoint json.RawMessage, rt *Tas
 		}
 	}
 
-	rt.AppendEntry(&EntryRecord{
-		ID:             entryID,
-		ConversationID: rt.ConversationID(),
-		Kind:           kindTool,
-		Model: []agent.Message{{
-			Role:       agent.RoleTool,
-			ToolCallID: in.CallID,
-			Name:       in.Name,
-			Content:    content,
-		}},
-	})
+	appendToolResultEntry(rt, entryID, in.CallID, in.Name, content)
 	rt.Harness().emit(in.SubmissionID, agent.Event{Type: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{ID: in.CallID, Name: in.Name, Result: evResult, Error: evErr}})
 	return NextState{
 		Status:  TaskTerminal,
@@ -375,17 +344,7 @@ func toolRestartLimitResult(rt *TaskRuntime, in toolInput) (NextState, error) {
 		return NextState{}, err
 	}
 	msg := fmt.Sprintf("Tool %s was interrupted %s; it is not run again", in.Name, cutOffCount(rt.Restarts()))
-	rt.AppendEntry(&EntryRecord{
-		ID:             entryID,
-		ConversationID: rt.ConversationID(),
-		Kind:           kindTool,
-		Model: []agent.Message{{
-			Role:       agent.RoleTool,
-			ToolCallID: in.CallID,
-			Name:       in.Name,
-			Content:    msg,
-		}},
-	})
+	appendToolResultEntry(rt, entryID, in.CallID, in.Name, msg)
 	rt.Harness().emit(in.SubmissionID, agent.Event{Type: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{ID: in.CallID, Name: in.Name, Error: msg}})
 	return NextState{
 		Status:  TaskTerminal,
@@ -401,17 +360,7 @@ func abortToolResult(rt *TaskRuntime, in toolInput) (NextState, error) {
 	if err != nil {
 		return NextState{}, err
 	}
-	rt.AppendEntry(&EntryRecord{
-		ID:             entryID,
-		ConversationID: rt.ConversationID(),
-		Kind:           kindTool,
-		Model: []agent.Message{{
-			Role:       agent.RoleTool,
-			ToolCallID: in.CallID,
-			Name:       in.Name,
-			Content:    abortedToolResult,
-		}},
-	})
+	appendToolResultEntry(rt, entryID, in.CallID, in.Name, abortedToolResult)
 	rt.Harness().emit(in.SubmissionID, agent.Event{Type: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{ID: in.CallID, Name: in.Name, Error: abortedToolResult}})
 	return NextState{Status: TaskTerminal, Outcome: &Outcome{Status: OutcomeAborted}}, nil
 }

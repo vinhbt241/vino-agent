@@ -82,8 +82,9 @@ func (c *Conversation) Compact(ctx context.Context, instructions string) error {
 	for _, e := range tail {
 		msgs = append(msgs, e.Model...)
 	}
-	// Never send a dangling assistant tool_calls to the provider.
-	msgs = sanitizeToolCalls(msgs)
+	// Keep the summarization prompt well-formed: reattach tool results to their
+	// assistant tool_calls and fill any missing ones.
+	msgs = assembleToolTurns(msgs)
 
 	resp, err := c.h.llm.Chat(ctx, msgs, nil, nil)
 	if err != nil {

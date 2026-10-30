@@ -578,6 +578,16 @@ func TestConcurrentSubmitQueuesBehindInFlightRun(t *testing.T) {
 	if len(entries) != 6 {
 		t.Fatalf("entries = %d, want 6 (user, assistant, tool, assistant, user, assistant)", len(entries))
 	}
+
+	// The second submission's user entry lands between the first run's
+	// assistant tool_calls and its tool result (entry IDs are monotonic). The
+	// context the model sees must still satisfy the tool-call schema, with the
+	// tool result pulled back next to its assistant turn.
+	for i, msgs := range llm.messages {
+		if !toolTurnSchemaHolds(msgs) {
+			t.Fatalf("llm call %d context violates the tool-call schema: %#v", i+1, msgs)
+		}
+	}
 }
 
 func TestCancelAbortsToolAndSettlesRun(t *testing.T) {
@@ -893,7 +903,7 @@ func TestAbortedPartialFeedsNextRunContext(t *testing.T) {
 	}
 }
 
-func TestSanitizeToolCalls(t *testing.T) {
+func TestAssembleToolTurns(t *testing.T) {
 	toolCall := agent.ToolCall{ID: "c1", Name: "search", Arguments: json.RawMessage(`{}`)}
 	cases := []struct {
 		name string
@@ -942,11 +952,49 @@ func TestSanitizeToolCalls(t *testing.T) {
 				{Role: agent.RoleUser, Content: "next"},
 			},
 		},
+		{
+			name: "tool result pulled up past an interleaved user turn",
+			in: []agent.Message{
+				{Role: agent.RoleUser, Content: "first"},
+				{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{toolCall}},
+				{Role: agent.RoleUser, Content: "second"},
+				{Role: agent.RoleTool, ToolCallID: "c1", Name: "search", Content: "hit"},
+			},
+			want: []agent.Message{
+				{Role: agent.RoleUser, Content: "first"},
+				{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{toolCall}},
+				{Role: agent.RoleTool, ToolCallID: "c1", Name: "search", Content: "hit"},
+				{Role: agent.RoleUser, Content: "second"},
+			},
+		},
+		{
+			name: "multiple calls reattached in call order",
+			in: []agent.Message{
+				{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{
+					{ID: "c1", Name: "a", Arguments: json.RawMessage(`{}`)},
+					{ID: "c2", Name: "b", Arguments: json.RawMessage(`{}`)},
+				}},
+				{Role: agent.RoleTool, ToolCallID: "c2", Name: "b", Content: "two"},
+				{Role: agent.RoleTool, ToolCallID: "c1", Name: "a", Content: "one"},
+			},
+			want: []agent.Message{
+				{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{
+					{ID: "c1", Name: "a", Arguments: json.RawMessage(`{}`)},
+					{ID: "c2", Name: "b", Arguments: json.RawMessage(`{}`)},
+				}},
+				{Role: agent.RoleTool, ToolCallID: "c1", Name: "a", Content: "one"},
+				{Role: agent.RoleTool, ToolCallID: "c2", Name: "b", Content: "two"},
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := sanitizeToolCalls(tc.in); !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("sanitizeToolCalls() = %#v, want %#v", got, tc.want)
+			got := assembleToolTurns(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("assembleToolTurns() = %#v, want %#v", got, tc.want)
+			}
+			if !toolTurnSchemaHolds(got) {
+				t.Fatalf("assembleToolTurns() output violates the schema: %#v", got)
 			}
 		})
 	}
