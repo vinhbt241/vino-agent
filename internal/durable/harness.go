@@ -223,7 +223,8 @@ func (h *Harness) Start(ctx context.Context, in StartInput, sink agent.EventSink
 }
 
 // buildMessages derives the model context for a conversation: the system
-// prompt followed by the conversation's entries in ID order.
+// prompt, then the latest compaction summary (if any), then the live tail —
+// the entries after that summary's head.
 func (h *Harness) buildMessages(ctx context.Context, conversationID ID, systemPrompt string) ([]agent.Message, error) {
 	var msgs []agent.Message
 	if systemPrompt == "" {
@@ -232,12 +233,15 @@ func (h *Harness) buildMessages(ctx context.Context, conversationID ID, systemPr
 	if systemPrompt != "" {
 		msgs = append(msgs, agent.Message{Role: agent.RoleSystem, Content: systemPrompt})
 	}
-	page, err := h.session.storage.ScanEntries(ctx, EntryQuery{ConversationID: conversationID, Order: OrderAscending}, 0, nil)
+	tail, comp, err := h.liveTail(ctx, conversationID)
 	if err != nil {
 		return nil, err
 	}
-	for i := range page.Items {
-		msgs = append(msgs, page.Items[i].Model...)
+	if comp != nil && len(comp.Model) > 0 {
+		msgs = append(msgs, comp.Model[0])
+	}
+	for _, e := range tail {
+		msgs = append(msgs, e.Model...)
 	}
 	return sanitizeToolCalls(msgs), nil
 }
