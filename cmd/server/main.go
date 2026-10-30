@@ -1,5 +1,5 @@
 // Command server runs the durable-agent HTTP server: it loads a config file,
-// wires the agent kernel to a real LLM provider and the concrete tool set,
+// wires the durable harness to a real LLM provider and the concrete tool set,
 // and serves /health and /runs.
 package main
 

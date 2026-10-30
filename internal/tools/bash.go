@@ -83,8 +83,8 @@ func (r *Registry) bash(ctx context.Context, args json.RawMessage) (string, erro
 	return out, nil
 }
 
-// shellExitError formats a non-zero exit as a tool error the kernel relays to
-// the model: the exit status plus the combined output.
+// shellExitError formats a non-zero exit as a tool error the durable harness
+// relays to the model: the exit status plus the combined output.
 func shellExitError(code int, stdout, stderr string) error {
 	combined := stdout
 	if stderr != "" {

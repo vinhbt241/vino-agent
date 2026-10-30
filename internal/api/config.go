@@ -1,6 +1,7 @@
 // Package api implements the durable-agent HTTP server: config loading,
-// routing, and the SSE run endpoint. It wires the kernel (internal/agent) to
-// a real provider (internal/llm) and the concrete tool set (internal/tools).
+// routing, and the SSE run endpoint. It wires the durable harness
+// (internal/durable) to a real provider (internal/llm) and the concrete tool
+// set (internal/tools).
 package api
 
 import (

@@ -1,9 +1,10 @@
 # vino
 
-A durable tool-using agent. This repo currently ships the agent kernel
-(`internal/agent`), a real OpenAI-compatible LLM provider (`internal/llm`),
-the concrete tool set (`internal/tools`), and an HTTP server (`cmd/server`)
-that wires them together.
+A durable tool-using agent. This repo ships the durable harness
+(`internal/durable`) that runs the tool-using loop with crash recovery,
+the shared agent types (`internal/agent`), a real OpenAI-compatible LLM
+provider (`internal/llm`), the concrete tool set (`internal/tools`), and an
+HTTP server (`cmd/server`) that wires them together.
 
 This guide covers spinning up the server with a proper config.
 
