@@ -64,6 +64,26 @@ func (b *blockingLLM) Chat(ctx context.Context, _ []agent.Message, _ []agent.Too
 	return agent.Response{}, ctx.Err()
 }
 
+// streamingBlockingLLM streams scripted deltas then blocks until the context
+// is cancelled, mirroring a real streaming model cut off mid-answer.
+type streamingBlockingLLM struct {
+	deltas     []string
+	started    chan struct{}
+	deltasSent chan struct{}
+}
+
+func (s *streamingBlockingLLM) Chat(ctx context.Context, _ []agent.Message, _ []agent.ToolSpec, onDelta func(string) error) (agent.Response, error) {
+	close(s.started)
+	for _, d := range s.deltas {
+		if err := onDelta(d); err != nil {
+			return agent.Response{}, err
+		}
+	}
+	close(s.deltasSent)
+	<-ctx.Done()
+	return agent.Response{}, ctx.Err()
+}
+
 func (f *fakeRegistry) Specs() []agent.ToolSpec { return f.specs }
 func (f *fakeRegistry) Call(_ context.Context, name string, _ json.RawMessage) (string, error) {
 	f.calls = append(f.calls, name)
@@ -698,6 +718,176 @@ func TestCancelDuringModelCallAborts(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Kind != kindUser {
 		t.Fatalf("entries = %+v, want a single user entry", entries)
+	}
+}
+
+func TestCancelMidStreamPersistsAbortedPartial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	llm := &streamingBlockingLLM{
+		deltas:     []string{"par", "tial"},
+		started:    make(chan struct{}),
+		deltasSent: make(chan struct{}),
+	}
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: llm})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var events []agent.Event
+	sub, err := h.Root().SubmitStream(ctx, SubmitInput{Content: "hi", RequestID: "r1"}, func(ev agent.Event) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitCh := make(chan *SubmissionRecord, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		rec, err := sub.Wait(ctx)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		waitCh <- rec
+	}()
+
+	select {
+	case <-llm.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("model call never started")
+	}
+	select {
+	case <-llm.deltasSent:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deltas never streamed")
+	}
+
+	cancel()
+
+	var rec *SubmissionRecord
+	select {
+	case rec = <-waitCh:
+	case err := <-errCh:
+		t.Fatalf("Wait: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait never returned")
+	}
+
+	if rec.Status != SubmissionUnanswered {
+		t.Fatalf("status = %s, want unanswered", rec.Status)
+	}
+
+	entries, err := h.Root().Entries(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2 (user, assistant)", len(entries))
+	}
+	if entries[0].Kind != kindUser {
+		t.Fatalf("entries[0].Kind = %s, want user", entries[0].Kind)
+	}
+	a := entries[1]
+	if a.Kind != kindAssistant {
+		t.Fatalf("entries[1].Kind = %s, want assistant", a.Kind)
+	}
+	if len(a.Model) != 1 || a.Model[0].Role != agent.RoleAssistant || a.Model[0].Content != "partial" {
+		t.Fatalf("entries[1].Model = %+v, want assistant partial", a.Model)
+	}
+	var data assistantEntryData
+	if err := json.Unmarshal(a.Data, &data); err != nil || !data.Aborted {
+		t.Fatalf("entries[1].Data = %s, want aborted marker", a.Data)
+	}
+
+	var sawDeltas bool
+	for _, ev := range events {
+		if ev.Type == agent.EventTextDelta {
+			sawDeltas = true
+		}
+	}
+	if !sawDeltas {
+		t.Fatal("sink never saw a text delta")
+	}
+}
+
+func TestAbortedPartialFeedsNextRunContext(t *testing.T) {
+	ctx1, cancel := context.WithCancel(context.Background())
+	st := NewMemoryStorage()
+	llm := &streamingBlockingLLM{
+		deltas:     []string{"half answer"},
+		started:    make(chan struct{}),
+		deltasSent: make(chan struct{}),
+	}
+	h, err := Open(ctx1, st, HarnessOptions{LLM: llm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := h.Root().Submit(ctx1, SubmitInput{Content: "first", RequestID: "r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCh := make(chan *SubmissionRecord, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		rec, err := sub.Wait(ctx1)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		waitCh <- rec
+	}()
+	<-llm.started
+	<-llm.deltasSent
+	cancel()
+
+	var rec *SubmissionRecord
+	select {
+	case rec = <-waitCh:
+	case err := <-errCh:
+		t.Fatalf("Wait: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait never returned")
+	}
+	if rec.Status != SubmissionUnanswered {
+		t.Fatalf("status = %s, want unanswered", rec.Status)
+	}
+
+	llm2 := &fakeLLM{steps: []llmStep{{resp: agent.Response{Content: "ok"}}}}
+	h2, err := Open(context.Background(), st, HarnessOptions{LLM: llm2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub2, err := h2.Root().Submit(context.Background(), SubmitInput{Content: "second", RequestID: "r2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec2, err := sub2.Wait(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec2.Status != SubmissionDone {
+		t.Fatalf("second status = %s, want done", rec2.Status)
+	}
+	if llm2.calls != 1 {
+		t.Fatalf("llm2 calls = %d, want 1", llm2.calls)
+	}
+
+	var foundAborted, foundUser bool
+	for _, m := range llm2.messages[0] {
+		switch {
+		case m.Role == agent.RoleAssistant && m.Content == "half answer":
+			foundAborted = true
+		case m.Role == agent.RoleUser && m.Content == "second":
+			foundUser = true
+		}
+	}
+	if !foundAborted {
+		t.Fatalf("context missing aborted partial: %+v", llm2.messages[0])
+	}
+	if !foundUser {
+		t.Fatalf("context missing new user turn: %+v", llm2.messages[0])
 	}
 }
 

@@ -3,6 +3,7 @@ package durable
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"vino/internal/agent"
@@ -16,6 +17,11 @@ const (
 	kindGeneration = "vino.generation"
 	kindToolTask   = "vino.tool"
 )
+
+// assistantEntryData is the kind-specific data attached to assistant entries.
+type assistantEntryData struct {
+	Aborted bool `json:"aborted,omitempty"`
+}
 
 // abortedToolResult is the tool result recorded when the client cancels the
 // stream mid-tool-call: the action is aborted but the transcript keeps a
@@ -52,7 +58,7 @@ func (g generationTask) Step(ctx context.Context, checkpoint json.RawMessage, rt
 	if rt.AbortRequested() {
 		var in generationInput
 		_ = json.Unmarshal(rt.Input(), &in)
-		return g.abort(rt, in.SubmissionID), nil
+		return g.abort(rt, in.SubmissionID, "")
 	}
 	var cp generationCheckpoint
 	if len(checkpoint) > 0 {
@@ -98,14 +104,16 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 		specs = h.tools.Specs()
 	}
 
+	var partial strings.Builder
 	onDelta := func(delta string) error {
+		partial.WriteString(delta)
 		h.emit(in.SubmissionID, agent.Event{Type: agent.EventTextDelta, TextDelta: &agent.TextDelta{Text: delta}})
 		return nil
 	}
 	resp, err := h.llm.Chat(ctx, messages, specs, onDelta)
 	if err != nil {
 		if ctx.Err() != nil {
-			return g.abort(rt, in.SubmissionID), nil
+			return g.abort(rt, in.SubmissionID, partial.String())
 		}
 		return NextState{}, err
 	}
@@ -193,12 +201,27 @@ func settleSubmission(rt *TaskRuntime, submissionID ID, answerID ID) {
 }
 
 // abort settles the submission as unanswered and ends the generation task
-// with an aborted outcome, without calling the model again.
-func (g generationTask) abort(rt *TaskRuntime, submissionID ID) NextState {
+// with an aborted outcome, without calling the model again. Partial text that
+// streamed before the cancel is committed as an aborted assistant entry so
+// the transcript keeps the partial answer.
+func (g generationTask) abort(rt *TaskRuntime, submissionID ID, partial string) (NextState, error) {
+	if partial != "" {
+		entryID, err := rt.MintID()
+		if err != nil {
+			return NextState{}, err
+		}
+		rt.AppendEntry(&EntryRecord{
+			ID:             entryID,
+			ConversationID: rt.ConversationID(),
+			Kind:           kindAssistant,
+			Model:          []agent.Message{{Role: agent.RoleAssistant, Content: partial}},
+			Data:           mustJSON(assistantEntryData{Aborted: true}),
+		})
+	}
 	if submissionID != 0 {
 		rt.Harness().settleUnanswered(rt.Ctx(), submissionID, "run cancelled by client")
 	}
-	return NextState{Status: TaskTerminal, Outcome: &Outcome{Status: OutcomeAborted}}
+	return NextState{Status: TaskTerminal, Outcome: &Outcome{Status: OutcomeAborted}}, nil
 }
 
 // toolInput is the tool task's durable input.
