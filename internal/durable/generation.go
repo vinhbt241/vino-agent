@@ -3,6 +3,7 @@ package durable
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -94,15 +95,30 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 		return NextState{}, agent.ErrMaxIterations
 	}
 
-	messages, err := h.buildMessages(rt.Ctx(), rt.ConversationID(), in.SystemPrompt)
+	conv, err := rt.Conversation(rt.ConversationID())
+	if err != nil {
+		return NextState{}, err
+	}
+	if conv == nil {
+		return NextState{}, fmt.Errorf("durable: conversation %d not found", rt.ConversationID())
+	}
+
+	systemPrompt := in.SystemPrompt
+	if systemPrompt == "" {
+		systemPrompt = conv.Agent.SystemPrompt
+	}
+
+	messages, err := h.buildMessages(rt.Ctx(), rt.ConversationID(), systemPrompt)
 	if err != nil {
 		return NextState{}, err
 	}
 
 	var specs []agent.ToolSpec
-	if h.tools != nil {
-		specs = h.tools.Specs()
+	if r := h.toolsFor(conv.Agent); r != nil {
+		specs = r.Specs()
 	}
+
+	llm := h.llmFor(conv.Agent.Model)
 
 	var partial strings.Builder
 	onDelta := func(delta string) error {
@@ -110,7 +126,7 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 		h.emit(in.SubmissionID, agent.Event{Type: agent.EventTextDelta, TextDelta: &agent.TextDelta{Text: delta}})
 		return nil
 	}
-	resp, err := h.llm.Chat(ctx, messages, specs, onDelta)
+	resp, err := llm.Chat(ctx, messages, specs, onDelta)
 	if err != nil {
 		if ctx.Err() != nil {
 			return g.abort(rt, in.SubmissionID, partial.String())

@@ -19,12 +19,21 @@ type OwnerRef struct {
 	TaskID         ID `json:"taskId"`
 }
 
+// AgentConfig is a conversation's agent configuration. Empty fields fall back
+// to the harness defaults.
+type AgentConfig struct {
+	Model        string   `json:"model,omitempty"`
+	SystemPrompt string   `json:"systemPrompt,omitempty"`
+	Tools        []string `json:"tools,omitempty"`
+}
+
 // ConversationRecord is a transcript scope. Parent (fork) and owner (task
-// attribution) are separate edges.
+// attribution) are separate edges; Agent holds per-conversation config.
 type ConversationRecord struct {
-	ID     ID        `json:"id"`
-	Parent *ForkRef  `json:"parent,omitempty"`
-	Owner  *OwnerRef `json:"owner,omitempty"`
+	ID     ID          `json:"id"`
+	Parent *ForkRef    `json:"parent,omitempty"`
+	Owner  *OwnerRef   `json:"owner,omitempty"`
+	Agent  AgentConfig `json:"agent,omitempty"`
 }
 
 // EntryRecord is an immutable transcript record. Model holds the wire

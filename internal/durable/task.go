@@ -56,6 +56,10 @@ func (rt *TaskRuntime) Entry(id ID) (*EntryRecord, error) {
 	return rt.session.storage.Entry(rt.ctx, id)
 }
 
+func (rt *TaskRuntime) Conversation(id ID) (*ConversationRecord, error) {
+	return rt.session.storage.Conversation(rt.ctx, id)
+}
+
 func (rt *TaskRuntime) Task(id ID) (*TaskRecord, error) {
 	return rt.session.storage.Task(rt.ctx, id)
 }

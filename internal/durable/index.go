@@ -64,9 +64,6 @@ func (ix *recordIndex) validateLocked(writes []StorageWrite) error {
 			if rec.ID == 0 {
 				return errors.New("durable: conversation with zero ID")
 			}
-			if _, exists := ix.conversations[rec.ID]; exists {
-				return fmt.Errorf("durable: conversation %d already exists", rec.ID)
-			}
 		case WriteEntry:
 			rec, ok := w.Value.(*EntryRecord)
 			if !ok {

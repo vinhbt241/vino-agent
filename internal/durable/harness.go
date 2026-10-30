@@ -18,6 +18,9 @@ type HarnessOptions struct {
 	Model        string
 	SystemPrompt string
 	Definitions  []TaskDefinition
+	// Models maps names to model clients for per-conversation selection via
+	// AgentConfig.Model. Unnamed or unknown models fall back to LLM.
+	Models map[string]agent.LLM
 }
 
 // Harness is the host-facing facade over a Session and Scheduler.
@@ -28,6 +31,7 @@ type Harness struct {
 	tools        agent.ToolRegistry
 	model        string
 	systemPrompt string
+	models       map[string]agent.LLM
 	defs         []TaskDefinition
 
 	sinkMu sync.Mutex
@@ -51,6 +55,7 @@ func Open(ctx context.Context, storage Storage, opts HarnessOptions) (*Harness, 
 		tools:        opts.Tools,
 		model:        opts.Model,
 		systemPrompt: opts.SystemPrompt,
+		models:       opts.Models,
 		defs:         defs,
 		sinks:        make(map[ID]agent.EventSink),
 	}
@@ -223,8 +228,9 @@ func (h *Harness) Start(ctx context.Context, in StartInput, sink agent.EventSink
 }
 
 // buildMessages derives the model context for a conversation: the system
-// prompt, then the latest compaction summary (if any), then the live tail —
-// the entries after that summary's head.
+// prompt, then the fork ancestors' raw history (root-most first, each cut at
+// its child's fork point), then the conversation's own compaction summary (if
+// any) and live tail.
 func (h *Harness) buildMessages(ctx context.Context, conversationID ID, systemPrompt string) ([]agent.Message, error) {
 	var msgs []agent.Message
 	if systemPrompt == "" {
@@ -233,6 +239,15 @@ func (h *Harness) buildMessages(ctx context.Context, conversationID ID, systemPr
 	if systemPrompt != "" {
 		msgs = append(msgs, agent.Message{Role: agent.RoleSystem, Content: systemPrompt})
 	}
+
+	ancestors, err := h.ancestorEntries(ctx, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range ancestors {
+		msgs = append(msgs, e.Model...)
+	}
+
 	tail, comp, err := h.liveTail(ctx, conversationID)
 	if err != nil {
 		return nil, err
@@ -244,6 +259,107 @@ func (h *Harness) buildMessages(ctx context.Context, conversationID ID, systemPr
 		msgs = append(msgs, e.Model...)
 	}
 	return sanitizeToolCalls(msgs), nil
+}
+
+// ancestorEntries returns the raw (non-compaction) entries from the
+// conversation's fork ancestors, in context order (root-most ancestor first),
+// each cut at the fork point its child was cut at.
+func (h *Harness) ancestorEntries(ctx context.Context, conversationID ID) ([]EntryRecord, error) {
+	type link struct {
+		convID ID
+		cut    ID
+	}
+	var links []link
+	cur := conversationID
+	for {
+		rec, err := h.session.storage.Conversation(ctx, cur)
+		if err != nil {
+			return nil, err
+		}
+		if rec == nil || rec.Parent == nil {
+			break
+		}
+		links = append(links, link{rec.Parent.ConversationID, rec.Parent.At})
+		cur = rec.Parent.ConversationID
+	}
+	var out []EntryRecord
+	for i := len(links) - 1; i >= 0; i-- {
+		entries, err := h.rawEntriesUpTo(ctx, links[i].convID, &links[i].cut)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, entries...)
+	}
+	return out, nil
+}
+
+// rawEntriesUpTo returns a conversation's entries with ID <= cut (when cut is
+// non-nil), excluding compaction entries, in ascending order.
+func (h *Harness) rawEntriesUpTo(ctx context.Context, convID ID, cut *ID) ([]EntryRecord, error) {
+	q := EntryQuery{ConversationID: convID, Order: OrderAscending}
+	if cut != nil {
+		q.MaxID = cut
+	}
+	page, err := h.session.storage.ScanEntries(ctx, q, 0, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out []EntryRecord
+	for _, e := range page.Items {
+		if e.Kind == kindCompaction {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// llmFor resolves the model client a conversation names, falling back to the
+// harness default.
+func (h *Harness) llmFor(model string) agent.LLM {
+	if model != "" && h.models != nil {
+		if m, ok := h.models[model]; ok {
+			return m
+		}
+	}
+	return h.llm
+}
+
+// toolsFor returns the tool registry for a conversation: the harness registry,
+// filtered to the allow-list when the conversation configures one.
+func (h *Harness) toolsFor(cfg AgentConfig) agent.ToolRegistry {
+	if len(cfg.Tools) == 0 || h.tools == nil {
+		return h.tools
+	}
+	allow := make(map[string]bool, len(cfg.Tools))
+	for _, n := range cfg.Tools {
+		allow[n] = true
+	}
+	return toolFilter{base: h.tools, allow: allow}
+}
+
+// toolFilter exposes a subset of a tool registry's specs. Call passes through
+// to the base registry (only specs the model saw are ever requested).
+type toolFilter struct {
+	base  agent.ToolRegistry
+	allow map[string]bool
+}
+
+func (f toolFilter) Specs() []agent.ToolSpec {
+	if f.base == nil {
+		return nil
+	}
+	var out []agent.ToolSpec
+	for _, s := range f.base.Specs() {
+		if f.allow[s.Name] {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (f toolFilter) Call(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	return f.base.Call(ctx, name, args)
 }
 
 // cancelledToolResult is the placeholder tool result written when an assistant

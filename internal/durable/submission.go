@@ -2,6 +2,8 @@ package durable
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"vino/internal/agent"
@@ -55,6 +57,53 @@ func (c *Conversation) ID() ID { return c.id }
 // Record returns the conversation's record (its fork/owner edges).
 func (c *Conversation) Record(ctx context.Context) (*ConversationRecord, error) {
 	return c.h.session.storage.Conversation(ctx, c.id)
+}
+
+// Fork creates a child conversation cut at entry at: the fork's context is the
+// parent's history up to and including at, plus whatever the fork itself
+// appends. The parent's entries are referenced, never copied. cfg overrides
+// the fork's agent configuration (empty fields inherit the harness defaults).
+func (c *Conversation) Fork(ctx context.Context, at *EntryRecord, cfg AgentConfig) (*Conversation, error) {
+	if at == nil {
+		return nil, errors.New("durable: fork: nil entry")
+	}
+	if at.ConversationID != c.id {
+		return nil, fmt.Errorf("durable: fork: entry %d belongs to conversation %d, not %d", at.ID, at.ConversationID, c.id)
+	}
+	var child *Conversation
+	err := c.h.session.Commit(ctx, func(tx *Tx) error {
+		id, err := tx.MintID(ctx)
+		if err != nil {
+			return err
+		}
+		tx.WriteConversation(&ConversationRecord{
+			ID:     id,
+			Parent: &ForkRef{ConversationID: c.id, At: at.ID},
+			Agent:  cfg,
+		})
+		child = &Conversation{h: c.h, id: id}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return child, nil
+}
+
+// Configure replaces the conversation's agent configuration.
+func (c *Conversation) Configure(ctx context.Context, cfg AgentConfig) error {
+	return c.h.session.Commit(ctx, func(tx *Tx) error {
+		rec, err := tx.Conversation(ctx, c.id)
+		if err != nil {
+			return err
+		}
+		if rec == nil {
+			return ErrConversationNotFound
+		}
+		rec.Agent = cfg
+		tx.WriteConversation(rec)
+		return nil
+	})
 }
 
 // Submit admits a user input: a user entry, a submission record, and a
