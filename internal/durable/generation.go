@@ -117,6 +117,17 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 		specs = reg.Specs()
 	}
 
+	for _, e := range h.activeExtensions(conv.Agent) {
+		if e.Hooks.BeforeModel == nil {
+			continue
+		}
+		req, err := e.Hooks.BeforeModel(ctx, rt, ModelRequest{Messages: messages, Tools: specs})
+		if err != nil {
+			return NextState{}, err
+		}
+		messages, specs = req.Messages, req.Tools
+	}
+
 	llm := h.llmFor(conv.Agent.Model)
 
 	var partial strings.Builder
@@ -138,6 +149,16 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 	// discard the answer instead of committing it over an aborted run.
 	if cur, err := rt.Task(rt.TaskID()); err == nil && cur != nil && cur.AbortRequested {
 		return g.abort(rt, in.SubmissionID, "")
+	}
+
+	for _, e := range h.activeExtensions(conv.Agent) {
+		if e.Hooks.AfterModel == nil {
+			continue
+		}
+		resp, err = e.Hooks.AfterModel(ctx, rt, resp)
+		if err != nil {
+			return NextState{}, err
+		}
 	}
 
 	assistantID, err := rt.MintID()
@@ -316,19 +337,7 @@ func (toolTaskDef) Step(ctx context.Context, checkpoint json.RawMessage, rt *Tas
 		content = fmt.Sprintf("tool %q is not registered", in.Name)
 		evErr = content
 	} else {
-		result, callErr := reg.Call(ctx, in.Name, in.Arguments)
-		switch {
-		case ctx.Err() != nil:
-			content = abortedToolResult
-			evErr = content
-			rt.markAbortCascade()
-		case callErr != nil:
-			content = callErr.Error()
-			evErr = callErr.Error()
-		default:
-			content = result
-			evResult = result
-		}
+		content, evResult, evErr = runToolCall(ctx, rt, in, reg, rt.Harness().activeExtensions(conv.Agent))
 	}
 
 	appendToolResultEntry(rt, entryID, in.CallID, in.Name, content)
@@ -337,6 +346,52 @@ func (toolTaskDef) Step(ctx context.Context, checkpoint json.RawMessage, rt *Tas
 		Status:  TaskTerminal,
 		Outcome: &Outcome{Status: OutcomeCompleted, Result: mustJSON(content)},
 	}, nil
+}
+
+// runToolCall executes one tool call through the BeforeTool/AfterTool hooks.
+// Hooks run in activation order: BeforeTool transforms the arguments before
+// reg.Call, AfterTool transforms the outcome after. A hook error becomes the
+// tool-result content (the model sees it, the run continues), matching how a
+// tool execution error is reported; it never faults the tool task.
+func runToolCall(ctx context.Context, rt *TaskRuntime, in toolInput, reg agent.ToolRegistry, exts []Extension) (content, evResult, evErr string) {
+	call := agent.ToolCall{ID: in.CallID, Name: in.Name, Arguments: in.Arguments}
+	for _, e := range exts {
+		if e.Hooks.BeforeTool == nil {
+			continue
+		}
+		c, err := e.Hooks.BeforeTool(ctx, rt, call)
+		if err != nil {
+			return err.Error(), "", err.Error()
+		}
+		call = c
+	}
+
+	result, callErr := reg.Call(ctx, in.Name, call.Arguments)
+	if ctx.Err() != nil {
+		rt.markAbortCascade()
+		return abortedToolResult, "", abortedToolResult
+	}
+
+	outcome := ToolOutcome{}
+	if callErr != nil {
+		outcome.Err = callErr.Error()
+	} else {
+		outcome.Result = result
+	}
+	for _, e := range exts {
+		if e.Hooks.AfterTool == nil {
+			continue
+		}
+		o, err := e.Hooks.AfterTool(ctx, rt, outcome)
+		if err != nil {
+			return err.Error(), "", err.Error()
+		}
+		outcome = o
+	}
+	if outcome.Err != "" {
+		return outcome.Err, "", outcome.Err
+	}
+	return outcome.Result, outcome.Result, ""
 }
 
 // cutOffCount renders a restart count for interruption messages: "once", or

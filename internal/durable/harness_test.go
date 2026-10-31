@@ -52,6 +52,7 @@ type fakeRegistry struct {
 	specs   []agent.ToolSpec
 	results map[string]string
 	calls   []string
+	args    []json.RawMessage
 }
 
 // blockingLLM signals when its Chat is invoked and blocks until the context
@@ -87,8 +88,9 @@ func (s *streamingBlockingLLM) Chat(ctx context.Context, _ []agent.Message, _ []
 }
 
 func (f *fakeRegistry) Specs() []agent.ToolSpec { return f.specs }
-func (f *fakeRegistry) Call(_ context.Context, name string, _ json.RawMessage) (string, error) {
+func (f *fakeRegistry) Call(_ context.Context, name string, args json.RawMessage) (string, error) {
 	f.calls = append(f.calls, name)
+	f.args = append(f.args, args)
 	return f.results[name], nil
 }
 

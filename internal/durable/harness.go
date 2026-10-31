@@ -24,6 +24,8 @@ type Extension struct {
 	Tools        agent.ToolRegistry
 	Tasks        []TaskDefinition
 	SystemPrompt []string
+	Hooks        Hooks
+	WrapTool     map[string]ToolWrapper
 }
 
 // HarnessOptions wires a harness to the application's model, tools, and any
@@ -346,6 +348,18 @@ func (h *Harness) llmFor(model string) agent.LLM {
 	return h.llm
 }
 
+// activeExtensions returns the extensions a conversation activates, in
+// AgentConfig.Extensions order, skipping unknown names.
+func (h *Harness) activeExtensions(cfg AgentConfig) []Extension {
+	var out []Extension
+	for _, name := range cfg.Extensions {
+		if e, ok := h.exts[name]; ok {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // toolsFor returns the merged tool registry for a conversation: the base
 // registry (allow-listed when cfg.Tools is set) followed by the active
 // extensions' tools in cfg.Extensions order, where a later definition of a
@@ -360,19 +374,41 @@ func (h *Harness) toolsFor(cfg AgentConfig) agent.ToolRegistry {
 		base = toolFilter{base: base, allow: allow}
 	}
 
-	var exts []agent.ToolRegistry
-	for _, name := range cfg.Extensions {
-		if e, ok := h.exts[name]; ok && e.Tools != nil {
-			exts = append(exts, e.Tools)
+	exts := h.activeExtensions(cfg)
+	var regs []agent.ToolRegistry
+	if base != nil {
+		regs = append(regs, base)
+	}
+	for _, e := range exts {
+		if e.Tools != nil {
+			regs = append(regs, e.Tools)
 		}
 	}
-	if len(exts) == 0 {
-		return base
+
+	var merged agent.ToolRegistry
+	switch len(regs) {
+	case 0:
+		merged = nil
+	case 1:
+		merged = regs[0]
+	default:
+		merged = mergeToolRegistries(regs...)
 	}
-	regs := make([]agent.ToolRegistry, 0, len(exts)+1)
-	regs = append(regs, base)
-	regs = append(regs, exts...)
-	return mergeToolRegistries(regs...)
+	if merged == nil {
+		return nil
+	}
+
+	// WrapTool decorates the winner under each name, after shadow resolution.
+	// Iterate in reverse activation order so the earliest-activated wrapper
+	// ends up outermost (runs first).
+	for i := len(exts) - 1; i >= 0; i-- {
+		for name, wrap := range exts[i].WrapTool {
+			if wrap != nil {
+				merged = wrapToolRegistry(merged, name, wrap)
+			}
+		}
+	}
+	return merged
 }
 
 // mergedTools composes tool registries by name: later registries shadow
@@ -422,6 +458,31 @@ func (m *mergedTools) Call(ctx context.Context, name string, args json.RawMessag
 	return "", fmt.Errorf("durable: tool %q is not registered", name)
 }
 
+// wrapToolRegistry decorates a registry's Call for one tool name: calls for
+// name route through wrap (whose next reaches the underlying provider); all
+// other names pass through unchanged. Specs are unaffected.
+func wrapToolRegistry(reg agent.ToolRegistry, name string, wrap ToolWrapper) agent.ToolRegistry {
+	return &wrappedTool{base: reg, name: name, wrap: wrap}
+}
+
+type wrappedTool struct {
+	base agent.ToolRegistry
+	name string
+	wrap ToolWrapper
+}
+
+func (w *wrappedTool) Specs() []agent.ToolSpec { return w.base.Specs() }
+
+func (w *wrappedTool) Call(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	if name != w.name {
+		return w.base.Call(ctx, name, args)
+	}
+	next := func(ctx context.Context, n string, a json.RawMessage) (string, error) {
+		return w.base.Call(ctx, n, a)
+	}
+	return w.wrap(ctx, name, args, next)
+}
+
 // extensionSections returns the system-prompt sections of a conversation's
 // active extensions, in activation order, skipping unknown names.
 func (h *Harness) extensionSections(ctx context.Context, conversationID ID) []string {
@@ -430,10 +491,8 @@ func (h *Harness) extensionSections(ctx context.Context, conversationID ID) []st
 		return nil
 	}
 	var out []string
-	for _, name := range conv.Agent.Extensions {
-		if e, ok := h.exts[name]; ok {
-			out = append(out, e.SystemPrompt...)
-		}
+	for _, e := range h.activeExtensions(conv.Agent) {
+		out = append(out, e.SystemPrompt...)
 	}
 	return out
 }
