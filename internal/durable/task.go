@@ -37,6 +37,10 @@ type TaskRuntime struct {
 	// own ctx) without preventing the run from persisting its settled state.
 	ctx    context.Context
 	writes []StorageWrite
+	// docs tracks documents staged this step by name, so a second SetDocument
+	// for the same name replaces the staged value instead of minting a second
+	// ID and tripping name-uniqueness validation.
+	docs map[string]*DocumentRecord
 }
 
 func (rt *TaskRuntime) TaskID() ID             { return rt.task.ID }
@@ -70,6 +74,59 @@ func (rt *TaskRuntime) Submission(id ID) (*SubmissionRecord, error) {
 
 func (rt *TaskRuntime) ScanEntries(q EntryQuery) (*Page[EntryRecord], error) {
 	return rt.session.storage.ScanEntries(rt.ctx, q, 0, nil)
+}
+
+// Document returns a document's committed value, or its definition's default
+// when this conversation has never written it. The name must be declared.
+func (rt *TaskRuntime) Document(name string) (json.RawMessage, error) {
+	def, ok := rt.harness.documentDef(name)
+	if !ok {
+		return nil, ErrDocumentUndeclared
+	}
+	rec, err := rt.session.storage.DocumentByName(rt.ctx, rt.task.ConversationID, name)
+	if err != nil {
+		return nil, err
+	}
+	if rec != nil {
+		return rec.Value, nil
+	}
+	return append(json.RawMessage(nil), def.Default...), nil
+}
+
+// SetDocument stages a full-value replacement of a named document for the
+// step's atomic commit. The name must be declared; the existing record (if
+// any) is replaced in place, otherwise a new record is minted. A later
+// SetDocument for the same name in the same step replaces the staged value
+// (last write wins). The staged value is not visible to Document until the
+// step's commit lands.
+func (rt *TaskRuntime) SetDocument(name string, value json.RawMessage) error {
+	if _, ok := rt.harness.documentDef(name); !ok {
+		return ErrDocumentUndeclared
+	}
+	if rec, ok := rt.docs[name]; ok {
+		rec.Value = value
+		return nil
+	}
+	rec, err := rt.session.storage.DocumentByName(rt.ctx, rt.task.ConversationID, name)
+	if err != nil {
+		return err
+	}
+	if rec == nil {
+		id, err := rt.MintID()
+		if err != nil {
+			return err
+		}
+		rec = &DocumentRecord{ID: id, ConversationID: rt.task.ConversationID, Name: name}
+	}
+	rec.Value = value
+	rt.docs[name] = rec
+	rt.AppendDocument(rec)
+	return nil
+}
+
+// AppendDocument stages a document write for the step's atomic commit.
+func (rt *TaskRuntime) AppendDocument(rec *DocumentRecord) {
+	rt.writes = append(rt.writes, StorageWrite{Type: WriteDocument, Value: rec})
 }
 
 // AppendEntry stages an entry write for the step's atomic commit.

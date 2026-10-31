@@ -2,8 +2,10 @@ package durable
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"vino/internal/agent"
@@ -83,12 +85,55 @@ func (c *Conversation) Fork(ctx context.Context, at *EntryRecord, cfg AgentConfi
 			Agent:  cfg,
 		})
 		child = &Conversation{h: c.h, id: id}
+
+		// Copy documents per their fork mode: current copies the parent's
+		// resolved value as an explicit snapshot; fresh writes nothing (the
+		// child resolves to the default on read).
+		names := make([]string, 0, len(c.h.docs))
+		for name := range c.h.docs {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			def := c.h.docs[name]
+			if resolveFork(def.Fork) == DocumentForkFresh {
+				continue
+			}
+			value := def.Default
+			if rec, err := tx.DocumentByName(ctx, c.id, name); err != nil {
+				return err
+			} else if rec != nil {
+				value = rec.Value
+			}
+			docID, err := tx.MintID(ctx)
+			if err != nil {
+				return err
+			}
+			tx.WriteDocument(&DocumentRecord{ID: docID, ConversationID: id, Name: name, Value: value})
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	return child, nil
+}
+
+// Document returns a document's committed value, or its definition's default
+// when the conversation has never written it. The name must be declared.
+func (c *Conversation) Document(ctx context.Context, name string) (json.RawMessage, error) {
+	def, ok := c.h.documentDef(name)
+	if !ok {
+		return nil, ErrDocumentUndeclared
+	}
+	rec, err := c.h.session.storage.DocumentByName(ctx, c.id, name)
+	if err != nil {
+		return nil, err
+	}
+	if rec != nil {
+		return rec.Value, nil
+	}
+	return append(json.RawMessage(nil), def.Default...), nil
 }
 
 // Configure replaces the conversation's agent configuration.

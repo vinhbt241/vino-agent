@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -26,6 +27,9 @@ type HarnessOptions struct {
 	// Models maps names to model clients for per-conversation selection via
 	// AgentConfig.Model. Unnamed or unknown models fall back to LLM.
 	Models map[string]agent.LLM
+	// Documents declares the named documents every conversation can hold: their
+	// default value and fork mode.
+	Documents []DocumentDefinition
 	// RestartLimit is the number of consecutive crashes after which a task
 	// ends itself instead of running again. Values <= 0 resolve to the
 	// default (5).
@@ -42,6 +46,7 @@ type Harness struct {
 	systemPrompt string
 	models       map[string]agent.LLM
 	defs         []TaskDefinition
+	docs         map[string]DocumentDefinition
 	restartLimit int
 
 	sinkMu sync.Mutex
@@ -71,6 +76,17 @@ func Open(ctx context.Context, storage Storage, opts HarnessOptions) (*Harness, 
 	defs := append([]TaskDefinition(nil), builtinDefinitions()...)
 	defs = append(defs, opts.Definitions...)
 
+	docs := make(map[string]DocumentDefinition, len(opts.Documents))
+	for _, d := range opts.Documents {
+		if d.Name == "" {
+			return nil, errors.New("durable: document definition with empty name")
+		}
+		if _, exists := docs[d.Name]; exists {
+			return nil, fmt.Errorf("durable: duplicate document definition %q", d.Name)
+		}
+		docs[d.Name] = d
+	}
+
 	h := &Harness{
 		session:      session,
 		llm:          opts.LLM,
@@ -79,6 +95,7 @@ func Open(ctx context.Context, storage Storage, opts HarnessOptions) (*Harness, 
 		systemPrompt: opts.SystemPrompt,
 		models:       opts.Models,
 		defs:         defs,
+		docs:         docs,
 		restartLimit: resolveRestartLimit(opts.RestartLimit),
 		sinks:        make(map[ID]agent.EventSink),
 		abortCancel:  make(map[ID]context.CancelFunc),
@@ -101,6 +118,12 @@ func (h *Harness) definition(kind string) TaskDefinition {
 		}
 	}
 	return nil
+}
+
+// documentDef returns the registered definition for a document name.
+func (h *Harness) documentDef(name string) (DocumentDefinition, bool) {
+	d, ok := h.docs[name]
+	return d, ok
 }
 
 func (h *Harness) ensureRoot(ctx context.Context) error {

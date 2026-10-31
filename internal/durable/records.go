@@ -19,6 +19,44 @@ type OwnerRef struct {
 	TaskID         ID `json:"taskId"`
 }
 
+// DocumentFork is a document's fork mode: how its value is derived when its
+// conversation is forked.
+type DocumentFork string
+
+const (
+	// DocumentForkCurrent copies the parent's current value at fork time.
+	DocumentForkCurrent DocumentFork = "current"
+	// DocumentForkFresh gives the fork a fresh default value.
+	DocumentForkFresh DocumentFork = "fresh"
+)
+
+// resolveFork maps the empty value to the default fork mode.
+func resolveFork(f DocumentFork) DocumentFork {
+	if f == "" {
+		return DocumentForkCurrent
+	}
+	return f
+}
+
+// DocumentDefinition declares a named document for every conversation: its
+// default value (returned when a conversation never wrote the document) and
+// how the document is forked.
+type DocumentDefinition struct {
+	Name    string          `json:"name"`
+	Default json.RawMessage `json:"default,omitempty"`
+	Fork    DocumentFork    `json:"fork,omitempty"`
+}
+
+// DocumentRecord is a conversation-scoped named JSON value. Name is unique
+// per conversation; a document with no record resolves to its definition's
+// default on read.
+type DocumentRecord struct {
+	ID             ID              `json:"id"`
+	ConversationID ID              `json:"conversationId"`
+	Name           string          `json:"name"`
+	Value          json.RawMessage `json:"value,omitempty"`
+}
+
 // AgentConfig is a conversation's agent configuration. Empty fields fall back
 // to the harness defaults.
 type AgentConfig struct {

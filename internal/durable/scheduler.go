@@ -215,7 +215,7 @@ func (sch *Scheduler) runOne(execCtx, durableCtx context.Context, task *TaskReco
 			return nil
 		}
 
-		rt := &TaskRuntime{session: sch.session, harness: sch.harness, task: cur, ctx: durableCtx}
+		rt := &TaskRuntime{session: sch.session, harness: sch.harness, task: cur, ctx: durableCtx, docs: make(map[string]*DocumentRecord)}
 		next, err := def.Step(execCtx, cur.State.Checkpoint, rt)
 		if err != nil {
 			return sch.fault(durableCtx, cur, err.Error())

@@ -15,6 +15,7 @@ import (
 func runConformance(t *testing.T, newStore func(*testing.T) Storage, reopen func(*testing.T, Storage) Storage) {
 	ctx := context.Background()
 	store := newStore(t)
+	var reopenDocID ID
 
 	t.Run("conversation entry task submission", func(t *testing.T) {
 		convID, _ := store.MintID(ctx)
@@ -165,6 +166,98 @@ func runConformance(t *testing.T, newStore func(*testing.T) Storage, reopen func
 		}
 	})
 
+	t.Run("document write replace scan clone", func(t *testing.T) {
+		convID, _ := store.MintID(ctx)
+		docID, _ := store.MintID(ctx)
+		if _, err := store.Commit(ctx, []StorageWrite{
+			{Type: WriteConversation, Value: &ConversationRecord{ID: convID}},
+			{Type: WriteDocument, Value: &DocumentRecord{ID: docID, ConversationID: convID, Name: "plan", Value: json.RawMessage(`{"n":1}`)}},
+		}); err != nil {
+			t.Fatalf("seed document: %v", err)
+		}
+		reopenDocID = docID
+
+		d, _ := store.Document(ctx, docID)
+		if d == nil || d.Name != "plan" || string(d.Value) != `{"n":1}` {
+			t.Fatalf("document = %+v", d)
+		}
+		bn, _ := store.DocumentByName(ctx, convID, "plan")
+		if bn == nil || bn.ID != docID {
+			t.Fatalf("documentByName = %+v", bn)
+		}
+
+		// Replace the same ID in place.
+		if _, err := store.Commit(ctx, []StorageWrite{
+			{Type: WriteDocument, Value: &DocumentRecord{ID: docID, ConversationID: convID, Name: "plan", Value: json.RawMessage(`{"n":2}`)}},
+		}); err != nil {
+			t.Fatalf("replace document: %v", err)
+		}
+		d, _ = store.Document(ctx, docID)
+		if string(d.Value) != `{"n":2}` {
+			t.Fatalf("document value = %s, want {\"n\":2}", d.Value)
+		}
+
+		// Name is unique per conversation: a second ID with the same name fails.
+		otherID, _ := store.MintID(ctx)
+		if _, err := store.Commit(ctx, []StorageWrite{
+			{Type: WriteDocument, Value: &DocumentRecord{ID: otherID, ConversationID: convID, Name: "plan", Value: json.RawMessage(`{}`)}},
+		}); err == nil {
+			t.Fatal("expected duplicate document name to fail")
+		}
+
+		// ...and so does the same name under two IDs within one batch.
+		idA, _ := store.MintID(ctx)
+		idB, _ := store.MintID(ctx)
+		if _, err := store.Commit(ctx, []StorageWrite{
+			{Type: WriteDocument, Value: &DocumentRecord{ID: idA, ConversationID: convID, Name: "notes", Value: json.RawMessage(`1`)}},
+			{Type: WriteDocument, Value: &DocumentRecord{ID: idB, ConversationID: convID, Name: "notes", Value: json.RawMessage(`2`)}},
+		}); err == nil {
+			t.Fatal("expected same-name document batch to fail")
+		}
+
+		// Reads clone: mutating the returned value must not reach storage.
+		d, _ = store.Document(ctx, docID)
+		d.Value = json.RawMessage(`{"mutated":true}`)
+		again, _ := store.Document(ctx, docID)
+		if string(again.Value) != `{"n":2}` {
+			t.Fatalf("read returned aliased document value: %s", again.Value)
+		}
+	})
+
+	t.Run("document scan filters and paginates", func(t *testing.T) {
+		convID, _ := store.MintID(ctx)
+		if _, err := store.Commit(ctx, []StorageWrite{
+			{Type: WriteConversation, Value: &ConversationRecord{ID: convID}},
+		}); err != nil {
+			t.Fatalf("seed conversation: %v", err)
+		}
+		ids := make([]ID, 3)
+		for i := range ids {
+			ids[i], _ = store.MintID(ctx)
+		}
+		if _, err := store.Commit(ctx, []StorageWrite{
+			{Type: WriteDocument, Value: &DocumentRecord{ID: ids[0], ConversationID: convID, Name: "a", Value: json.RawMessage(`1`)}},
+			{Type: WriteDocument, Value: &DocumentRecord{ID: ids[1], ConversationID: convID, Name: "b", Value: json.RawMessage(`2`)}},
+			{Type: WriteDocument, Value: &DocumentRecord{ID: ids[2], ConversationID: convID, Name: "c", Value: json.RawMessage(`3`)}},
+		}); err != nil {
+			t.Fatalf("seed documents: %v", err)
+		}
+
+		page1, _ := store.ScanDocuments(ctx, DocumentQuery{ConversationID: &convID, Order: OrderAscending}, 2, nil)
+		if len(page1.Items) != 2 || page1.Items[0].Name != "a" || page1.Items[1].Name != "b" || page1.Next == nil {
+			t.Fatalf("asc page1 = %+v next=%v", page1.Items, page1.Next)
+		}
+		page2, _ := store.ScanDocuments(ctx, DocumentQuery{ConversationID: &convID, Order: OrderAscending}, 2, page1.Next)
+		if len(page2.Items) != 1 || page2.Items[0].Name != "c" || page2.Next != nil {
+			t.Fatalf("asc page2 = %+v next=%v", page2.Items, page2.Next)
+		}
+
+		named, _ := store.ScanDocuments(ctx, DocumentQuery{Name: "b", Order: OrderAscending}, 0, nil)
+		if len(named.Items) != 1 || named.Items[0].Name != "b" {
+			t.Fatalf("name-filtered scan = %+v", named.Items)
+		}
+	})
+
 	t.Run("clone on read", func(t *testing.T) {
 		entryID, _ := store.MintID(ctx)
 		if _, err := store.Commit(ctx, []StorageWrite{
@@ -184,6 +277,9 @@ func runConformance(t *testing.T, newStore func(*testing.T) Storage, reopen func
 	store = reopen(t, store)
 
 	t.Run("state survives reopen and mint continues", func(t *testing.T) {
+		if d, _ := store.Document(ctx, reopenDocID); d == nil || string(d.Value) != `{"n":2}` {
+			t.Fatalf("document did not survive reopen: %+v", d)
+		}
 		before, _ := store.MintID(ctx)
 		id, _ := store.MintID(ctx)
 		if id <= before {

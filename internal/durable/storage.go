@@ -10,6 +10,7 @@ const (
 	WriteEntry        StorageWriteType = "entry"
 	WriteTask         StorageWriteType = "task"
 	WriteSubmission   StorageWriteType = "submission"
+	WriteDocument     StorageWriteType = "document"
 )
 
 // StorageWrite is one record write in a commit batch. Value is a pointer to
@@ -74,6 +75,13 @@ type SubmissionQuery struct {
 	Order          ScanOrder
 }
 
+// DocumentQuery filters a document scan.
+type DocumentQuery struct {
+	ConversationID *ID
+	Name           string
+	Order          ScanOrder
+}
+
 // Storage persists records atomically per commit and mints IDs from one global
 // namespace. Implementations are trusted to receive semantically valid writes;
 // the Session serializes commits. A successful Commit means the batch is
@@ -100,6 +108,10 @@ type Storage interface {
 	// server-wide, so a crash retry finds the original regardless of which
 	// conversation it was admitted into.
 	SubmissionByRequest(ctx context.Context, requestID string) (*SubmissionRecord, error)
+
+	Document(ctx context.Context, id ID) (*DocumentRecord, error)
+	DocumentByName(ctx context.Context, conversationID ID, name string) (*DocumentRecord, error)
+	ScanDocuments(ctx context.Context, q DocumentQuery, limit int, cursor *Cursor) (*Page[DocumentRecord], error)
 
 	Close(ctx context.Context) error
 }

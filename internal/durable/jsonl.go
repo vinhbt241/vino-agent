@@ -92,7 +92,7 @@ func (j *JSONLStorage) replay(f *os.File) error {
 			}
 			pending = nil
 			j.nextSeq = Seq(line.Seq)
-		case "conversation", "entry", "task", "submission":
+		case "conversation", "entry", "task", "submission", "document":
 			w, err := decodeWrite(line)
 			if err != nil {
 				return err
@@ -119,6 +119,11 @@ func (j *JSONLStorage) replay(f *os.File) error {
 		}
 	}
 	for id := range j.ix.submissions {
+		if id > maxStored {
+			maxStored = id
+		}
+	}
+	for id := range j.ix.documents {
 		if id > maxStored {
 			maxStored = id
 		}
@@ -155,6 +160,12 @@ func decodeWrite(line jsonlLine) (StorageWrite, error) {
 			return StorageWrite{}, err
 		}
 		return StorageWrite{Type: WriteSubmission, Value: &rec}, nil
+	case "document":
+		var rec DocumentRecord
+		if err := json.Unmarshal(line.Value, &rec); err != nil {
+			return StorageWrite{}, err
+		}
+		return StorageWrite{Type: WriteDocument, Value: &rec}, nil
 	default:
 		return StorageWrite{}, fmt.Errorf("unknown write type %q", line.Type)
 	}
@@ -249,6 +260,18 @@ func (j *JSONLStorage) ScanSubmissions(ctx context.Context, q SubmissionQuery, l
 
 func (j *JSONLStorage) SubmissionByRequest(ctx context.Context, requestID string) (*SubmissionRecord, error) {
 	return j.ix.submissionByRequest(requestID), ctx.Err()
+}
+
+func (j *JSONLStorage) Document(ctx context.Context, id ID) (*DocumentRecord, error) {
+	return j.ix.document(id), ctx.Err()
+}
+
+func (j *JSONLStorage) DocumentByName(ctx context.Context, conversationID ID, name string) (*DocumentRecord, error) {
+	return j.ix.documentByName(conversationID, name), ctx.Err()
+}
+
+func (j *JSONLStorage) ScanDocuments(ctx context.Context, q DocumentQuery, limit int, cursor *Cursor) (*Page[DocumentRecord], error) {
+	return j.ix.scanDocuments(q, limit, cursor), ctx.Err()
 }
 
 func (j *JSONLStorage) Close(ctx context.Context) error {

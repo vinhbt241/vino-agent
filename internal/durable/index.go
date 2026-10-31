@@ -19,6 +19,14 @@ type recordIndex struct {
 	tasks         map[ID]*TaskRecord
 	submissions   map[ID]*SubmissionRecord
 	reqIndex      map[string]*SubmissionRecord
+	documents     map[ID]*DocumentRecord
+	docByName     map[documentKey]*DocumentRecord
+}
+
+// documentKey indexes a document by its conversation and name.
+type documentKey struct {
+	ConversationID ID
+	Name           string
 }
 
 func newRecordIndex() *recordIndex {
@@ -28,6 +36,8 @@ func newRecordIndex() *recordIndex {
 		tasks:         make(map[ID]*TaskRecord),
 		submissions:   make(map[ID]*SubmissionRecord),
 		reqIndex:      make(map[string]*SubmissionRecord),
+		documents:     make(map[ID]*DocumentRecord),
+		docByName:     make(map[documentKey]*DocumentRecord),
 	}
 }
 
@@ -54,6 +64,10 @@ func (ix *recordIndex) validate(writes []StorageWrite) error {
 }
 
 func (ix *recordIndex) validateLocked(writes []StorageWrite) error {
+	// seen tracks document names minted earlier in this same batch, so two
+	// writes with the same name but different IDs in one commit fail loudly
+	// instead of silently orphaning the earlier record.
+	seen := make(map[documentKey]ID)
 	for _, w := range writes {
 		switch w.Type {
 		case WriteConversation:
@@ -96,6 +110,27 @@ func (ix *recordIndex) validateLocked(writes []StorageWrite) error {
 			if rec.ID == 0 {
 				return errors.New("durable: submission with zero ID")
 			}
+		case WriteDocument:
+			rec, ok := w.Value.(*DocumentRecord)
+			if !ok {
+				return fmt.Errorf("durable: document write carries %T", w.Value)
+			}
+			if rec.ID == 0 {
+				return errors.New("durable: document with zero ID")
+			}
+			if rec.ConversationID == 0 {
+				return errors.New("durable: document with zero conversation ID")
+			}
+			if rec.Name == "" {
+				return errors.New("durable: document with empty name")
+			}
+			if existing, exists := ix.docByName[documentKey{rec.ConversationID, rec.Name}]; exists && existing.ID != rec.ID {
+				return fmt.Errorf("durable: document name %q already exists in conversation %d", rec.Name, rec.ConversationID)
+			}
+			if seenID, exists := seen[documentKey{rec.ConversationID, rec.Name}]; exists && seenID != rec.ID {
+				return fmt.Errorf("durable: document name %q written twice in one commit for conversation %d", rec.Name, rec.ConversationID)
+			}
+			seen[documentKey{rec.ConversationID, rec.Name}] = rec.ID
 		default:
 			return fmt.Errorf("durable: unknown write type %q", w.Type)
 		}
@@ -123,6 +158,14 @@ func (ix *recordIndex) storeLocked(w StorageWrite) {
 		if rec.RequestID != "" {
 			ix.reqIndex[rec.RequestID] = clone(rec)
 		}
+	case WriteDocument:
+		rec := w.Value.(*DocumentRecord)
+		if old, exists := ix.documents[rec.ID]; exists && !(old.ConversationID == rec.ConversationID && old.Name == rec.Name) {
+			// A moved/renamed document must not leave a stale name entry.
+			delete(ix.docByName, documentKey{old.ConversationID, old.Name})
+		}
+		ix.documents[rec.ID] = clone(rec)
+		ix.docByName[documentKey{rec.ConversationID, rec.Name}] = clone(rec)
 	}
 }
 
@@ -226,6 +269,24 @@ func (ix *recordIndex) submissionByRequest(requestID string) *SubmissionRecord {
 	return nil
 }
 
+func (ix *recordIndex) document(id ID) *DocumentRecord {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	if rec, ok := ix.documents[id]; ok {
+		return clone(rec)
+	}
+	return nil
+}
+
+func (ix *recordIndex) documentByName(conversationID ID, name string) *DocumentRecord {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	if rec, ok := ix.docByName[documentKey{conversationID, name}]; ok {
+		return clone(rec)
+	}
+	return nil
+}
+
 // ---- scans ----
 
 func (ix *recordIndex) scanConversations(q ConversationQuery, limit int, cursor *Cursor) *Page[ConversationRecord] {
@@ -309,4 +370,21 @@ func (ix *recordIndex) scanSubmissions(q SubmissionQuery, limit int, cursor *Cur
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
 	return page(items, q.Order, limit, cursor, func(s SubmissionRecord) ID { return s.ID })
+}
+
+func (ix *recordIndex) scanDocuments(q DocumentQuery, limit int, cursor *Cursor) *Page[DocumentRecord] {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	var items []DocumentRecord
+	for _, rec := range ix.documents {
+		if q.ConversationID != nil && rec.ConversationID != *q.ConversationID {
+			continue
+		}
+		if q.Name != "" && rec.Name != q.Name {
+			continue
+		}
+		items = append(items, *clone(rec))
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	return page(items, q.Order, limit, cursor, func(d DocumentRecord) ID { return d.ID })
 }

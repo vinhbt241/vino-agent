@@ -16,6 +16,9 @@ var (
 	// ErrConversationNotFound is returned when a runtime operation targets a
 	// conversation that does not exist.
 	ErrConversationNotFound = errors.New("durable: conversation not found")
+	// ErrDocumentUndeclared is returned when a document name has no
+	// DocumentDefinition in the harness options.
+	ErrDocumentUndeclared = errors.New("durable: document is not declared")
 )
 
 // Session owns the mutation line: one writer at a time, atomic commits across
@@ -97,6 +100,19 @@ func (tx *Tx) SubmissionByRequest(ctx context.Context, requestID string) (*Submi
 	return tx.session.storage.SubmissionByRequest(ctx, requestID)
 }
 
+func (tx *Tx) Document(ctx context.Context, id ID) (*DocumentRecord, error) {
+	return tx.session.storage.Document(ctx, id)
+}
+
+func (tx *Tx) DocumentByName(ctx context.Context, conversationID ID, name string) (*DocumentRecord, error) {
+	return tx.session.storage.DocumentByName(ctx, conversationID, name)
+}
+
+// ScanDocuments reads all documents matching q (limit 0 means no bound).
+func (tx *Tx) ScanDocuments(ctx context.Context, q DocumentQuery) (*Page[DocumentRecord], error) {
+	return tx.session.storage.ScanDocuments(ctx, q, 0, nil)
+}
+
 // ScanTasks reads all tasks matching q (limit 0 means no bound).
 func (tx *Tx) ScanTasks(ctx context.Context, q TaskQuery) (*Page[TaskRecord], error) {
 	return tx.session.storage.ScanTasks(ctx, q, 0, nil)
@@ -131,4 +147,8 @@ func (tx *Tx) WriteTask(rec *TaskRecord) {
 
 func (tx *Tx) WriteSubmission(rec *SubmissionRecord) {
 	tx.writes = append(tx.writes, StorageWrite{Type: WriteSubmission, Value: rec})
+}
+
+func (tx *Tx) WriteDocument(rec *DocumentRecord) {
+	tx.writes = append(tx.writes, StorageWrite{Type: WriteDocument, Value: rec})
 }

@@ -79,4 +79,16 @@ func (m *MemoryStorage) SubmissionByRequest(ctx context.Context, requestID strin
 	return m.ix.submissionByRequest(requestID), ctx.Err()
 }
 
+func (m *MemoryStorage) Document(ctx context.Context, id ID) (*DocumentRecord, error) {
+	return m.ix.document(id), ctx.Err()
+}
+
+func (m *MemoryStorage) DocumentByName(ctx context.Context, conversationID ID, name string) (*DocumentRecord, error) {
+	return m.ix.documentByName(conversationID, name), ctx.Err()
+}
+
+func (m *MemoryStorage) ScanDocuments(ctx context.Context, q DocumentQuery, limit int, cursor *Cursor) (*Page[DocumentRecord], error) {
+	return m.ix.scanDocuments(q, limit, cursor), ctx.Err()
+}
+
 func (m *MemoryStorage) Close(ctx context.Context) error { return ctx.Err() }
