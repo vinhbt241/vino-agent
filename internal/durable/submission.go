@@ -37,6 +37,21 @@ func (s *Submission) Wait(ctx context.Context) (*SubmissionRecord, error) {
 	return s.h.session.storage.Submission(context.WithoutCancel(ctx), s.rec.ID)
 }
 
+// WhenBusy selects how a submission behaves when its conversation already has
+// a non-terminal generation task.
+type WhenBusy string
+
+const (
+	// WhenBusyQueue is the default: append the input and run it after the
+	// current run finishes.
+	WhenBusyQueue WhenBusy = ""
+	// WhenBusyReject fails the submission with ErrConversationBusy.
+	WhenBusyReject WhenBusy = "reject"
+	// WhenBusySteer merges the input into the in-flight run instead of
+	// queueing a second run.
+	WhenBusySteer WhenBusy = "steer"
+)
+
 // SubmitInput is a user input submission.
 type SubmitInput struct {
 	Content string
@@ -47,6 +62,7 @@ type SubmitInput struct {
 	SystemPrompt  string
 	MaxIterations int
 	ToolTimeout   time.Duration
+	WhenBusy      WhenBusy
 }
 
 // Conversation is a transcript scope handle.
@@ -160,6 +176,120 @@ func (c *Conversation) Submit(ctx context.Context, in SubmitInput) (*Submission,
 	return c.SubmitStream(ctx, in, nil)
 }
 
+// submitMessages resolves the turn list a submission appends to the transcript.
+func submitMessages(in SubmitInput) []agent.Message {
+	if len(in.Messages) > 0 {
+		return in.Messages
+	}
+	return []agent.Message{{Role: agent.RoleUser, Content: in.Content}}
+}
+
+// writeMessages writes a turn list as transcript entries and returns the last
+// entry's ID (nil when empty).
+func writeMessages(ctx context.Context, tx *Tx, conversationID ID, msgs []agent.Message) (*ID, error) {
+	var lastEntry *ID
+	for _, m := range msgs {
+		entryID, err := tx.MintID(ctx)
+		if err != nil {
+			return nil, err
+		}
+		kind := kindUser
+		if m.Role == agent.RoleAssistant {
+			kind = kindAssistant
+		}
+		tx.WriteEntry(&EntryRecord{ID: entryID, ConversationID: conversationID, Kind: kind, Model: []agent.Message{m}})
+		lastEntry = &entryID
+	}
+	return lastEntry, nil
+}
+
+// busyGeneration reports whether the conversation has a non-terminal
+// generation task (pending, running, or waiting).
+func busyGeneration(ctx context.Context, tx *Tx, conversationID ID) (bool, error) {
+	page, err := tx.ScanTasks(ctx, TaskQuery{ConversationID: &conversationID, Kind: kindGeneration, Order: OrderAscending})
+	if err != nil {
+		return false, err
+	}
+	for i := range page.Items {
+		switch page.Items[i].State.Status {
+		case TaskPending, TaskRunning, TaskWaiting:
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// originalSubmissionForSteer resolves the submission the oldest non-terminal
+// generation task is answering, which a steered submission resumes.
+func originalSubmissionForSteer(ctx context.Context, tx *Tx, conversationID ID) (*SubmissionRecord, error) {
+	page, err := tx.ScanTasks(ctx, TaskQuery{ConversationID: &conversationID, Kind: kindGeneration, Order: OrderAscending})
+	if err != nil {
+		return nil, err
+	}
+	for i := range page.Items {
+		t := page.Items[i]
+		switch t.State.Status {
+		case TaskPending, TaskRunning, TaskWaiting:
+		default:
+			continue
+		}
+		var in generationInput
+		if err := json.Unmarshal(t.Input, &in); err != nil {
+			return nil, err
+		}
+		if in.SubmissionID == 0 {
+			continue
+		}
+		return tx.Submission(ctx, in.SubmissionID)
+	}
+	return nil, nil
+}
+
+// submitWrites writes the transcript entries, submission record, and
+// generation task of a normal (queue) submission.
+func submitWrites(ctx context.Context, tx *Tx, h *Harness, conversationID ID, in SubmitInput) (*SubmissionRecord, error) {
+	subID, err := tx.MintID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	taskID, err := tx.MintID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	lastEntry, err := writeMessages(ctx, tx, conversationID, submitMessages(in))
+	if err != nil {
+		return nil, err
+	}
+
+	sub := &SubmissionRecord{
+		ID:             subID,
+		ConversationID: conversationID,
+		RequestID:      in.RequestID,
+		Type:           SubmissionInput,
+		Status:         SubmissionPlaced,
+		EntryID:        lastEntry,
+	}
+	tx.WriteSubmission(sub)
+
+	gen := h.definition(kindGeneration)
+	input := mustJSON(generationInput{
+		SubmissionID:  subID,
+		SystemPrompt:  in.SystemPrompt,
+		MaxIterations: in.MaxIterations,
+		ToolTimeoutMs: in.ToolTimeout.Milliseconds(),
+	})
+	tx.WriteTask(&TaskRecord{
+		ID:             taskID,
+		ConversationID: conversationID,
+		Kind:           kindGeneration,
+		Version:        gen.Version(),
+		Input:          input,
+		State:          TaskState{Status: TaskPending, Checkpoint: gen.Initial(input)},
+	})
+	return sub, nil
+}
+
 // SubmitStream admits a user input and, while the run executes, emits agent
 // events (text deltas, tool calls, tool results, run finished) to sink.
 func (c *Conversation) SubmitStream(ctx context.Context, in SubmitInput, sink agent.EventSink) (*Submission, error) {
@@ -172,8 +302,12 @@ func (c *Conversation) SubmitStream(ctx context.Context, in SubmitInput, sink ag
 		}
 	}
 
-	var sub *SubmissionRecord
-	resumed := false
+	var (
+		sub             *SubmissionRecord
+		resumed         bool
+		steered         bool
+		steeredOriginal *SubmissionRecord
+	)
 	err := c.h.session.Commit(ctx, func(tx *Tx) error {
 		if in.RequestID != "" {
 			if ex, err := tx.SubmissionByRequest(ctx, in.RequestID); err != nil {
@@ -184,68 +318,47 @@ func (c *Conversation) SubmitStream(ctx context.Context, in SubmitInput, sink ag
 				return nil
 			}
 		}
-		subID, err := tx.MintID(ctx)
+
+		busy, err := busyGeneration(ctx, tx, c.id)
 		if err != nil {
 			return err
 		}
-		taskID, err := tx.MintID(ctx)
-		if err != nil {
-			return err
-		}
 
-		msgs := in.Messages
-		if len(msgs) == 0 {
-			msgs = []agent.Message{{Role: agent.RoleUser, Content: in.Content}}
-		}
-		var lastEntry *ID
-		for _, m := range msgs {
-			entryID, err := tx.MintID(ctx)
-			if err != nil {
-				return err
+		if busy {
+			switch in.WhenBusy {
+			case WhenBusyReject:
+				return ErrConversationBusy
+			case WhenBusySteer:
+				orig, err := originalSubmissionForSteer(ctx, tx, c.id)
+				if err != nil {
+					return err
+				}
+				if _, err := writeMessages(ctx, tx, c.id, submitMessages(in)); err != nil {
+					return err
+				}
+				steered = true
+				steeredOriginal = orig
+				return nil
 			}
-			kind := kindUser
-			if m.Role == agent.RoleAssistant {
-				kind = kindAssistant
-			}
-			tx.WriteEntry(&EntryRecord{
-				ID:             entryID,
-				ConversationID: c.id,
-				Kind:           kind,
-				Model:          []agent.Message{m},
-			})
-			lastEntry = &entryID
 		}
 
-		sub = &SubmissionRecord{
-			ID:             subID,
-			ConversationID: c.id,
-			RequestID:      in.RequestID,
-			Type:           SubmissionInput,
-			Status:         SubmissionPlaced,
-			EntryID:        lastEntry,
-		}
-		tx.WriteSubmission(sub)
-
-		gen := c.h.definition(kindGeneration)
-		input := mustJSON(generationInput{
-			SubmissionID:  subID,
-			SystemPrompt:  in.SystemPrompt,
-			MaxIterations: in.MaxIterations,
-			ToolTimeoutMs: in.ToolTimeout.Milliseconds(),
-		})
-		tx.WriteTask(&TaskRecord{
-			ID:             taskID,
-			ConversationID: c.id,
-			Kind:           kindGeneration,
-			Version:        gen.Version(),
-			Input:          input,
-			State:          TaskState{Status: TaskPending, Checkpoint: gen.Initial(input)},
-		})
-		return nil
+		sub, err = submitWrites(ctx, tx, c.h, c.id, in)
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	if steered {
+		// Subscribe before steering so the re-run's events reach this client.
+		c.h.subscribeEvents(c.id, sink)
+		c.h.steer(c.id)
+		if steeredOriginal == nil {
+			return nil, errors.New("durable: steer: no in-flight submission")
+		}
+		return &Submission{h: c.h, rec: steeredOriginal, resumed: true}, nil
+	}
+
 	c.h.registerSink(sub.ConversationID, sub.ID, sink)
 	return &Submission{h: c.h, rec: sub, resumed: resumed}, nil
 }

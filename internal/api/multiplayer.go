@@ -224,6 +224,10 @@ func (s *sseWriter) start() {
 		for {
 			select {
 			case <-s.done:
+				// Flush anything enqueued before stop() was called, so the
+				// final frame is never dropped when done and a signal are
+				// both ready.
+				s.drain()
 				return
 			case <-s.sig:
 				s.drain()

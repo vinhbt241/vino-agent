@@ -21,6 +21,7 @@ type runRequest struct {
 	MaxIterations int          `json:"maxIterations"`
 	ToolTimeout   string       `json:"toolTimeout"`
 	RequestID     string       `json:"requestId"`
+	WhenBusy      string       `json:"whenBusy"`
 }
 
 // runMessage is one incoming conversation turn. Only user/assistant text
@@ -48,6 +49,11 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// whenBusy is parsed for schema parity; a fresh conversation is never busy.
+	if _, err := parseWhenBusy(req.WhenBusy); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	s.streamSubmission(w, r, func(sink agent.EventSink) (*durable.Submission, error) {
 		return s.harness.Start(r.Context(), durable.StartInput{
@@ -57,7 +63,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 			MaxIterations: req.MaxIterations,
 			ToolTimeout:   timeout,
 		}, sink)
-	})
+	}, 0)
 }
 
 // handleResumeConversation appends turns to an existing conversation and
@@ -88,6 +94,11 @@ func (s *Server) handleResumeConversation(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	whenBusy, err := parseWhenBusy(req.WhenBusy)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	c, err := s.harness.Conversation(r.Context(), id)
 	if err != nil {
@@ -106,25 +117,27 @@ func (s *Server) handleResumeConversation(w http.ResponseWriter, r *http.Request
 			Messages:      messages,
 			MaxIterations: req.MaxIterations,
 			ToolTimeout:   timeout,
+			WhenBusy:      whenBusy,
 		}, sink)
-	})
+	}, id)
 }
 
 // streamSubmission opens the SSE stream, creates a submission with sink, emits
 // the leading run_started, and waits for the run to settle, mapping the
 // terminal state to SSE events. It is shared by handleRun and
 // handleResumeConversation.
-func (s *Server) streamSubmission(w http.ResponseWriter, r *http.Request, create func(sink agent.EventSink) (*durable.Submission, error)) {
-	sseHeaders(w)
-	w.WriteHeader(http.StatusOK)
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+func (s *Server) streamSubmission(w http.ResponseWriter, r *http.Request, create func(sink agent.EventSink) (*durable.Submission, error), knownConversationID durable.ID) {
+	sw := newSSEWriter(w)
+	if sw == nil {
+		writeError(w, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
 
 	finished := false
-	var conversationID, submissionID string
+	conversationID := ""
+	if knownConversationID != 0 {
+		conversationID = formatID(knownConversationID)
+	}
 	sink := func(ev agent.Event) error {
 		if ev.Type == agent.EventRunFinished {
 			finished = true
@@ -133,18 +146,29 @@ func (s *Server) streamSubmission(w http.ResponseWriter, r *http.Request, create
 		if err != nil {
 			return err
 		}
-		return writeSSE(w, flusher, name, data)
+		return sw.send(name, data)
 	}
 
+	// Create before opening the stream so a pre-stream error (a busy reject)
+	// can still answer with a clean non-200 JSON status.
 	sub, err := create(sink)
 	if err != nil {
-		_ = writeSSE(w, flusher, "error", map[string]string{"error": err.Error()})
+		if errors.Is(err, durable.ErrConversationBusy) {
+			writeError(w, http.StatusConflict, "conversation is busy")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	conversationID = formatID(sub.ConversationID())
-	submissionID = formatID(sub.ID())
-	if err := writeSSE(w, flusher, "run_started", runStartedDTO{
+	sw.start()
+	defer sw.stop()
+
+	if conversationID == "" {
+		conversationID = formatID(sub.ConversationID())
+	}
+	submissionID := formatID(sub.ID())
+	if err := sw.send("run_started", runStartedDTO{
 		ConversationID: conversationID,
 		SubmissionID:   submissionID,
 		Resumed:        sub.Resumed(),
@@ -157,7 +181,7 @@ func (s *Server) streamSubmission(w http.ResponseWriter, r *http.Request, create
 	// settled transcript (in-flight tool calls are recorded as cancelled).
 	rec, err := sub.Wait(r.Context())
 	if err != nil {
-		_ = writeSSE(w, flusher, "error", map[string]string{"error": err.Error()})
+		_ = sw.send("error", map[string]string{"error": err.Error()})
 		return
 	}
 
@@ -167,12 +191,12 @@ func (s *Server) streamSubmission(w http.ResponseWriter, r *http.Request, create
 			// A retry that joined a run which already answered: replay the
 			// terminal event from the stored answer.
 			msg := s.answerMessage(r.Context(), rec)
-			_ = writeSSE(w, flusher, "run_finished", runFinishedDTO{FinalMessage: msg, ConversationID: conversationID})
+			_ = sw.send("run_finished", runFinishedDTO{FinalMessage: msg, ConversationID: conversationID})
 		}
 	case durable.SubmissionUnanswered:
-		_ = writeSSE(w, flusher, "error", map[string]string{"error": rec.Reason})
+		_ = sw.send("error", map[string]string{"error": rec.Reason})
 	default:
-		_ = writeSSE(w, flusher, "error", map[string]string{"error": "run did not settle"})
+		_ = sw.send("error", map[string]string{"error": "run did not settle"})
 	}
 }
 
@@ -191,6 +215,21 @@ func (s *Server) answerMessage(ctx context.Context, rec *durable.SubmissionRecor
 // validation before the SSE stream opens.
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// parseWhenBusy validates the whenBusy field. Empty means the default queue
+// behavior.
+func parseWhenBusy(s string) (durable.WhenBusy, error) {
+	switch s {
+	case "":
+		return durable.WhenBusyQueue, nil
+	case "reject":
+		return durable.WhenBusyReject, nil
+	case "steer":
+		return durable.WhenBusySteer, nil
+	default:
+		return "", fmt.Errorf("whenBusy: must be \"\", \"reject\", or \"steer\"")
+	}
 }
 
 // parseTimeout converts the request's toolTimeout string into a duration.

@@ -35,8 +35,9 @@ type generationInput struct {
 // generationCheckpoint tracks which phase the generation task is in and how
 // many model requests it has made.
 type generationCheckpoint struct {
-	Phase string `json:"phase"`
-	Turns int    `json:"turns"`
+	Phase  string `json:"phase"`
+	Turns  int    `json:"turns"`
+	Steers int    `json:"steers,omitempty"`
 }
 
 // generationTask is the built-in task that drives the model loop: send the
@@ -48,6 +49,13 @@ func (generationTask) Kind() string { return kindGeneration }
 func (generationTask) Version() int { return 1 }
 func (generationTask) Initial(input json.RawMessage) json.RawMessage {
 	return mustJSON(generationCheckpoint{Phase: "model"})
+}
+
+// steerReRun is the progress marker a generation step returns when a steer
+// interrupts its model request: bump the steer counter so the step is durable
+// progress, and re-enter the model phase with the now-larger transcript.
+func steerReRun(cp generationCheckpoint) NextState {
+	return NextState{Status: TaskRunning, Checkpoint: mustJSON(generationCheckpoint{Phase: "model", Turns: cp.Turns, Steers: cp.Steers + 1})}
 }
 
 func (g generationTask) Step(ctx context.Context, checkpoint json.RawMessage, rt *TaskRuntime) (NextState, error) {
@@ -69,13 +77,13 @@ func (g generationTask) Step(ctx context.Context, checkpoint json.RawMessage, rt
 	case "tools":
 		// Children are terminal (the scheduler only resumes us then). Loop
 		// back to the model with the tool results now in the transcript.
-		return NextState{Status: TaskRunning, Checkpoint: mustJSON(generationCheckpoint{Phase: "model", Turns: cp.Turns})}, nil
+		return NextState{Status: TaskRunning, Checkpoint: mustJSON(generationCheckpoint{Phase: "model", Turns: cp.Turns, Steers: cp.Steers})}, nil
 	default:
-		return g.stepModel(ctx, rt, cp.Turns)
+		return g.stepModel(ctx, rt, cp)
 	}
 }
 
-func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns int) (NextState, error) {
+func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, cp generationCheckpoint) (NextState, error) {
 	h := rt.Harness()
 
 	var in generationInput
@@ -89,7 +97,7 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 	if maxIter <= 0 {
 		maxIter = agent.DefaultMaxIterations
 	}
-	if turns >= maxIter {
+	if cp.Turns >= maxIter {
 		return NextState{}, agent.ErrMaxIterations
 	}
 
@@ -106,7 +114,16 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 		systemPrompt = conv.Agent.SystemPrompt
 	}
 
-	messages, err := h.contextMessages(rt.Ctx(), rt.ConversationID(), systemPrompt)
+	convID := rt.ConversationID()
+	epoch := h.steerEpochOf(convID)
+	modelCtx, cancel := context.WithCancel(ctx)
+	h.registerModelCancel(convID, cancel)
+	defer func() {
+		cancel()
+		h.clearModelCancel(convID)
+	}()
+
+	messages, err := h.contextMessages(rt.Ctx(), convID, systemPrompt)
 	if err != nil {
 		return NextState{}, err
 	}
@@ -128,17 +145,27 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 		messages, specs = req.Messages, req.Tools
 	}
 
+	// A steer committed while context was being assembled must re-run rather
+	// than send a request that missed the new input.
+	if h.steerEpochOf(convID) != epoch {
+		return steerReRun(cp), nil
+	}
+
 	llm := h.llmFor(conv.Agent.Model)
 
 	var partial strings.Builder
 	onDelta := func(delta string) error {
 		partial.WriteString(delta)
-		h.emit(rt.ConversationID(), agent.Event{Type: agent.EventTextDelta, TextDelta: &agent.TextDelta{Text: delta}})
+		h.emit(convID, agent.Event{Type: agent.EventTextDelta, TextDelta: &agent.TextDelta{Text: delta}})
 		return nil
 	}
-	resp, err := llm.Chat(ctx, messages, specs, onDelta)
+	resp, err := llm.Chat(modelCtx, messages, specs, onDelta)
 	if err != nil {
-		if ctx.Err() != nil {
+		if modelCtx.Err() != nil {
+			if h.steerEpochOf(convID) != epoch {
+				// Steered: discard the partial text and re-run with the new input.
+				return steerReRun(cp), nil
+			}
 			return g.abort(rt, in.SubmissionID, partial.String())
 		}
 		return NextState{}, err
@@ -212,7 +239,7 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 	}
 	return NextState{
 		Status:     TaskWaiting,
-		Checkpoint: mustJSON(generationCheckpoint{Phase: "tools", Turns: turns + 1}),
+		Checkpoint: mustJSON(generationCheckpoint{Phase: "tools", Turns: cp.Turns + 1}),
 		On:         children,
 	}, nil
 }

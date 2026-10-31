@@ -76,6 +76,10 @@ type Harness struct {
 
 	abortMu     sync.Mutex
 	abortCancel map[ID]context.CancelFunc
+
+	steerMu     sync.Mutex
+	steerEpoch  map[ID]uint64
+	modelCancel map[ID]context.CancelFunc
 }
 
 // resolveRestartLimit maps HarnessOptions.RestartLimit onto a concrete limit:
@@ -144,6 +148,8 @@ func Open(ctx context.Context, storage Storage, opts HarnessOptions) (*Harness, 
 		submitSinks:  make(map[ID]map[uint64]agent.EventSink),
 		watchSinks:   make(map[ID]map[uint64]agent.EventSink),
 		abortCancel:  make(map[ID]context.CancelFunc),
+		steerEpoch:   make(map[ID]uint64),
+		modelCancel:  make(map[ID]context.CancelFunc),
 	}
 	h.scheduler = NewScheduler(session, h, defs)
 
@@ -213,6 +219,43 @@ func (h *Harness) cancelAbort(conversationID ID) {
 	h.abortMu.Lock()
 	cancel := h.abortCancel[conversationID]
 	h.abortMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// registerModelCancel records the cancel func of a conversation's in-flight
+// model request so a steer can interrupt just that request, not the whole run.
+func (h *Harness) registerModelCancel(conversationID ID, cancel context.CancelFunc) {
+	h.steerMu.Lock()
+	h.modelCancel[conversationID] = cancel
+	h.steerMu.Unlock()
+}
+
+// clearModelCancel forgets the conversation's model cancel (the request
+// finished or was cancelled).
+func (h *Harness) clearModelCancel(conversationID ID) {
+	h.steerMu.Lock()
+	delete(h.modelCancel, conversationID)
+	h.steerMu.Unlock()
+}
+
+// steerEpochOf returns the conversation's steer epoch. The generation loop
+// compares this before and after a model request to tell a steer from an abort.
+func (h *Harness) steerEpochOf(conversationID ID) uint64 {
+	h.steerMu.Lock()
+	defer h.steerMu.Unlock()
+	return h.steerEpoch[conversationID]
+}
+
+// steer records a steer for the conversation and cancels its in-flight model
+// request, if any. Called after the steered entry is committed, so the re-run
+// sees the new transcript.
+func (h *Harness) steer(conversationID ID) {
+	h.steerMu.Lock()
+	h.steerEpoch[conversationID]++
+	cancel := h.modelCancel[conversationID]
+	h.steerMu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
@@ -556,6 +599,9 @@ func (h *Harness) unregisterSink(conversationID, submissionID ID) {
 // subscribeEvents registers fn as a conversation-scoped live-event subscriber
 // and returns an idempotent cancel. It backs Conversation.WatchEvents.
 func (h *Harness) subscribeEvents(conversationID ID, fn agent.EventSink) func() {
+	if fn == nil {
+		return func() {}
+	}
 	h.eventMu.Lock()
 	h.eventSubSeq++
 	id := h.eventSubSeq

@@ -164,7 +164,8 @@ Request body (all fields optional except `messages`):
   ],
   "maxIterations": 0,
   "toolTimeout": "30s",
-  "requestId": "job-42"
+  "requestId": "job-42",
+  "whenBusy": "reject"
 }
 ```
 
@@ -172,6 +173,9 @@ Request body (all fields optional except `messages`):
   server-side.
 - `maxIterations` `0` means the default cap (50).
 - `toolTimeout` is a Go duration string; empty means no timeout.
+- `whenBusy` is `""` (default queue), `"reject"`, or `"steer"`. It applies to
+  `POST /conversations/{id}/runs`; on `POST /runs` it is accepted but has no
+  effect (a fresh conversation is never busy). See `docs/api.md`.
 - `requestId` (optional) makes a run exactly-once: retrying a request that was
   cut off by a crash or dropped connection resumes the original run instead of
   starting a duplicate.

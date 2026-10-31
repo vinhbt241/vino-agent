@@ -22,6 +22,9 @@ var (
 	// ErrWatchSeqExpired is returned when a Watch starts after a sequence
 	// older than the retained commit window; the caller must re-View.
 	ErrWatchSeqExpired = errors.New("durable: watch seq expired")
+	// ErrConversationBusy is returned when a whenBusy:reject submission
+	// targets a conversation with a non-terminal generation task.
+	ErrConversationBusy = errors.New("durable: conversation is busy")
 )
 
 // retainCommitsDefault is the default Watch catch-up window: the number of

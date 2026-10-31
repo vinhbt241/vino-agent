@@ -42,6 +42,7 @@ Run the agent against the configured provider and stream the result as SSE.
 | `systemPrompt` | `string` | System prompt prepended to the conversation. |
 | `maxIterations` | `integer` | Loop cap. `0`/absent → default of `50`. |
 | `toolTimeout` | `string` | Per-tool timeout as a Go duration string (`"30s"`, `"1m"`). Empty/absent → no timeout. |
+| `whenBusy` | `string` | `""` (default, queue), `"reject"`, or `"steer"`. Accepted on `POST /runs` for schema parity but has no effect — a fresh conversation is never busy. See [whenBusy](#whenbusy). |
 
 `messages[]` entries:
 
@@ -139,14 +140,22 @@ One conversation with its full transcript.
 Append turns to an existing conversation and stream the result as SSE. The
 request body, validation, and SSE events are identical to `POST /runs`
 (including `requestId` exactly-once); the given `messages` are appended to the
-conversation's transcript in order.
+conversation's transcript in order. `whenBusy` applies here (see
+[whenBusy](#whenbusy)):
+
+- `""` (default) queues the new run after the current one.
+- `"reject"` answers `409` when the conversation is busy, without committing.
+- `"steer"` merges the input into the in-flight run: the stream returns the
+  original submission (with `resumed: true`) and the run re-runs its model
+  request with the new message in context.
 
 **Errors**
 
 | Status | When |
 |---|---|
+| `409` | `whenBusy:"reject"` on a busy conversation. |
 | `404` | Unknown conversation, or the internal root conversation (`1`). |
-| `400` | Malformed `{id}`, or the same body errors as `POST /runs`. |
+| `400` | Malformed `{id}`, an invalid `whenBusy`, or the same body errors as `POST /runs`. |
 
 ### `GET /conversations/{id}/view`
 
@@ -241,6 +250,19 @@ are the run events described in [SSE events](#sse-events), minus the leading
 |---|---|
 | `404` | Unknown conversation, or the internal root conversation (`1`). |
 | `400` | `{id}` is not a numeric ID. |
+
+### whenBusy
+
+`whenBusy` controls what happens when a submission targets a conversation that
+already has an in-flight generation run. A conversation is "busy" when it has
+a non-terminal generation task (`pending`/`running`/`waiting`); background
+tasks do not count.
+
+| Value | Behavior |
+|---|---|
+| `""` (default) | Queue: append the input and run it after the current run. |
+| `"reject"` | Fail with `409 {"error":"conversation is busy"}` before any commit. |
+| `"steer"` | Merge the input into the in-flight run: append the message to the transcript, cancel the current model request, and re-run it with the new message. The stream returns the original submission with `resumed: true`; the run still settles normally (not aborted). |
 
 ## SSE events
 
