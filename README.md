@@ -65,7 +65,8 @@ defaulting to `./vino.json`.
 | `providers.<name>.model` | model sent to the provider | *(required)* |
 | `tools.rootDir` | jail root for path-taking tools | process cwd |
 | `tools.workDir` | working dir for shell tools | `tools.rootDir` |
-| `durablePath` | JSONL log the durable harness writes | `vino.jsonl` |
+| `durablePath` | durable store path (`.db` for SQLite, `.jsonl` for JSONL) | `vino.db` / `vino.jsonl` |
+| `durableBackend` | storage backend: `sqlite` (default) or `jsonl` | `sqlite` |
 | `cors.origins` | allowed origins (`"*"` = any); empty → CORS off | empty (off) |
 | `cors.allowCredentials` | emit `Access-Control-Allow-Credentials` | `false` |
 | `cors.maxAge` | `Access-Control-Max-Age` in seconds | `600` |

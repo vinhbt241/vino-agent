@@ -15,12 +15,13 @@ const defaultAddr = "127.0.0.1:8080"
 
 // Config is the server's startup configuration.
 type Config struct {
-	Addr        string              `json:"addr"`
-	Default     string              `json:"default"`
-	Providers   map[string]Provider `json:"providers"`
-	Tools       ToolsConfig         `json:"tools"`
-	DurablePath string              `json:"durablePath"`
-	CORS        CORSConfig          `json:"cors"`
+	Addr           string              `json:"addr"`
+	Default        string              `json:"default"`
+	Providers      map[string]Provider `json:"providers"`
+	Tools          ToolsConfig         `json:"tools"`
+	DurablePath    string              `json:"durablePath"`
+	DurableBackend string              `json:"durableBackend"`
+	CORS           CORSConfig          `json:"cors"`
 }
 
 // Provider is one named LLM provider. APIKey may be empty in the file and
@@ -63,8 +64,16 @@ func LoadConfig(path string) (Config, error) {
 	if cfg.Addr == "" {
 		cfg.Addr = defaultAddr
 	}
+	cfg.DurableBackend = strings.ToLower(strings.TrimSpace(cfg.DurableBackend))
+	if cfg.DurableBackend == "" {
+		cfg.DurableBackend = "sqlite"
+	}
 	if cfg.DurablePath == "" {
-		cfg.DurablePath = "vino.jsonl"
+		if cfg.DurableBackend == "jsonl" {
+			cfg.DurablePath = "vino.jsonl"
+		} else {
+			cfg.DurablePath = "vino.db"
+		}
 	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
@@ -93,6 +102,9 @@ func applyEnv(cfg *Config) {
 func (c Config) validate() error {
 	if c.Default == "" {
 		return fmt.Errorf("api: config: default provider is required")
+	}
+	if c.DurableBackend != "sqlite" && c.DurableBackend != "jsonl" {
+		return fmt.Errorf("api: config: durableBackend %q must be \"sqlite\" or \"jsonl\"", c.DurableBackend)
 	}
 	if _, ok := c.Providers[c.Default]; !ok {
 		return fmt.Errorf("api: config: default provider %q not found in providers", c.Default)

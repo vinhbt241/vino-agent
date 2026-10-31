@@ -32,7 +32,7 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("api: tools: %w", err)
 	}
 
-	store, err := durable.OpenJSONL(cfg.DurablePath, false)
+	store, err := openStore(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("api: durable store: %w", err)
 	}
@@ -45,6 +45,20 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("api: durable harness: %w", err)
 	}
 	return newServer(harness, cfg.CORS), nil
+}
+
+// openStore opens the configured durable backend. DurableBackend is
+// normalized and validated by LoadConfig; this switch is the one place a
+// backend string becomes a Storage.
+func openStore(cfg Config) (durable.Storage, error) {
+	switch cfg.DurableBackend {
+	case "jsonl":
+		return durable.OpenJSONL(cfg.DurablePath, false)
+	case "sqlite":
+		return durable.OpenSQLite(cfg.DurablePath)
+	default:
+		return nil, fmt.Errorf("api: unknown durable backend %q", cfg.DurableBackend)
+	}
 }
 
 // newServer wires a harness into a Server with its routes registered and CORS

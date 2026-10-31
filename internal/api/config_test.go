@@ -59,6 +59,75 @@ func TestLoadConfig_DefaultsAddr(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_DefaultsDurableBackendAndPath(t *testing.T) {
+	path := writeConfig(t, `{
+		"default": "openai",
+		"providers": {"openai": {"apiKey": "k", "baseURL": "b", "model": "m"}}
+	}`)
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v, want nil", err)
+	}
+	if cfg.DurableBackend != "sqlite" {
+		t.Fatalf("DurableBackend = %q, want sqlite", cfg.DurableBackend)
+	}
+	if cfg.DurablePath != "vino.db" {
+		t.Fatalf("DurablePath = %q, want vino.db", cfg.DurablePath)
+	}
+}
+
+func TestLoadConfig_JSONLBackendDefaultsPath(t *testing.T) {
+	path := writeConfig(t, `{
+		"default": "openai",
+		"providers": {"openai": {"apiKey": "k", "baseURL": "b", "model": "m"}},
+		"durableBackend": "jsonl"
+	}`)
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v, want nil", err)
+	}
+	if cfg.DurableBackend != "jsonl" {
+		t.Fatalf("DurableBackend = %q, want jsonl", cfg.DurableBackend)
+	}
+	if cfg.DurablePath != "vino.jsonl" {
+		t.Fatalf("DurablePath = %q, want vino.jsonl", cfg.DurablePath)
+	}
+}
+
+func TestLoadConfig_DurableBackendNormalizedAndExplicitPathWins(t *testing.T) {
+	path := writeConfig(t, `{
+		"default": "openai",
+		"providers": {"openai": {"apiKey": "k", "baseURL": "b", "model": "m"}},
+		"durableBackend": " SQLite ",
+		"durablePath": "/tmp/x.db"
+	}`)
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v, want nil", err)
+	}
+	if cfg.DurableBackend != "sqlite" {
+		t.Fatalf("DurableBackend = %q, want normalized sqlite", cfg.DurableBackend)
+	}
+	if cfg.DurablePath != "/tmp/x.db" {
+		t.Fatalf("DurablePath = %q, want explicit /tmp/x.db", cfg.DurablePath)
+	}
+}
+
+func TestLoadConfig_InvalidDurableBackend(t *testing.T) {
+	path := writeConfig(t, `{
+		"default": "openai",
+		"providers": {"openai": {"apiKey": "k", "baseURL": "b", "model": "m"}},
+		"durableBackend": "postgres"
+	}`)
+
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("LoadConfig() error = nil, want error")
+	}
+}
+
 func TestLoadConfig_EnvOverridesProvider(t *testing.T) {
 	t.Setenv("VINO_PROVIDER_OPENAI_API_KEY", "envkey")
 	t.Setenv("VINO_PROVIDER_OPENAI_BASE_URL", "http://localhost:1234/v1")

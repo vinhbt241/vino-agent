@@ -346,15 +346,16 @@ func TestRun_RequestIDDedup(t *testing.T) {
 	}
 }
 
-func TestNewServer_WiresDurableStore(t *testing.T) {
+func TestNewServer_DefaultsToSQLite(t *testing.T) {
 	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "vino.db")
 	cfgPath := filepath.Join(dir, "vino.json")
 	cfg := `{
 		"addr": "127.0.0.1:0",
 		"default": "openai",
 		"providers": {"openai": {"apiKey": "k", "baseURL": "https://example.com/v1", "model": "m"}},
 		"tools": {"rootDir": "` + dir + `", "workDir": "` + dir + `"},
-		"durablePath": "` + filepath.Join(dir, "vino.jsonl") + `"
+		"durablePath": "` + dbPath + `"
 	}`
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -372,9 +373,47 @@ func TestNewServer_WiresDurableStore(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("health status = %d, want 200", rr.Code)
 	}
-	// The durable log was created.
-	if _, err := os.Stat(loaded.DurablePath); err != nil {
-		t.Fatalf("durable log not created: %v", err)
+	// The durable store is a real SQLite database, not a JSONL log.
+	data, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("sqlite db not created: %v", err)
+	}
+	if !strings.HasPrefix(string(data), "SQLite format 3\x00") {
+		t.Fatalf("durable store is not SQLite (first bytes %q)", data)
+	}
+}
+
+func TestNewServer_JSONLBackend(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "vino.jsonl")
+	cfgPath := filepath.Join(dir, "vino.json")
+	cfg := `{
+		"addr": "127.0.0.1:0",
+		"default": "openai",
+		"providers": {"openai": {"apiKey": "k", "baseURL": "https://example.com/v1", "model": "m"}},
+		"tools": {"rootDir": "` + dir + `", "workDir": "` + dir + `"},
+		"durableBackend": "jsonl",
+		"durablePath": "` + logPath + `"
+	}`
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewServer(loaded)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("health status = %d, want 200", rr.Code)
+	}
+	// The JSONL log was created.
+	if _, err := os.Stat(logPath); err != nil {
+		t.Fatalf("jsonl log not created: %v", err)
 	}
 }
 
