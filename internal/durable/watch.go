@@ -88,7 +88,7 @@ func (c *Conversation) WatchEvents(ctx context.Context, fn agent.EventSink) (fun
 	} else if conv == nil {
 		return nil, ErrConversationNotFound
 	}
-	return c.h.subscribeEvents(c.id, fn), nil
+	return c.h.events.Subscribe(c.id, fn), nil
 }
 
 // viewWrite reports whether a committed write belongs to the conversation's

@@ -297,7 +297,7 @@ func (c *Conversation) SubmitStream(ctx context.Context, in SubmitInput, sink ag
 		if ex, err := c.h.session.storage.SubmissionByRequest(ctx, in.RequestID); err != nil {
 			return nil, err
 		} else if ex != nil {
-			c.h.registerSink(ex.ConversationID, ex.ID, sink)
+			c.h.events.RegisterSubmit(ex.ConversationID, ex.ID, sink)
 			return &Submission{h: c.h, rec: ex, resumed: true}, nil
 		}
 	}
@@ -351,7 +351,7 @@ func (c *Conversation) SubmitStream(ctx context.Context, in SubmitInput, sink ag
 
 	if steered {
 		// Subscribe before steering so the re-run's events reach this client.
-		c.h.subscribeEvents(c.id, sink)
+		c.h.events.Subscribe(c.id, sink)
 		c.h.steer(c.id)
 		if steeredOriginal == nil {
 			return nil, errors.New("durable: steer: no in-flight submission")
@@ -359,7 +359,7 @@ func (c *Conversation) SubmitStream(ctx context.Context, in SubmitInput, sink ag
 		return &Submission{h: c.h, rec: steeredOriginal, resumed: true}, nil
 	}
 
-	c.h.registerSink(sub.ConversationID, sub.ID, sink)
+	c.h.events.RegisterSubmit(sub.ConversationID, sub.ID, sink)
 	return &Submission{h: c.h, rec: sub, resumed: resumed}, nil
 }
 
