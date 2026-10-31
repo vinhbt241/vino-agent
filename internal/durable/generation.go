@@ -133,7 +133,7 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 	var partial strings.Builder
 	onDelta := func(delta string) error {
 		partial.WriteString(delta)
-		h.emit(in.SubmissionID, agent.Event{Type: agent.EventTextDelta, TextDelta: &agent.TextDelta{Text: delta}})
+		h.emit(rt.ConversationID(), agent.Event{Type: agent.EventTextDelta, TextDelta: &agent.TextDelta{Text: delta}})
 		return nil
 	}
 	resp, err := llm.Chat(ctx, messages, specs, onDelta)
@@ -170,8 +170,8 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 		final := agent.Message{Role: agent.RoleAssistant, Content: resp.Content}
 		appendAssistantEntry(rt, assistantID, final, nil)
 		settleSubmission(rt, in.SubmissionID, assistantID)
-		h.emit(in.SubmissionID, agent.Event{Type: agent.EventRunFinished, RunFinished: &agent.RunFinishedEvent{FinalMessage: final}})
-		h.unregisterSink(in.SubmissionID)
+		h.emit(rt.ConversationID(), agent.Event{Type: agent.EventRunFinished, RunFinished: &agent.RunFinishedEvent{FinalMessage: final}})
+		h.unregisterSink(rt.ConversationID(), in.SubmissionID)
 		return NextState{
 			Status:  TaskTerminal,
 			Outcome: &Outcome{Status: OutcomeCompleted, Result: mustJSON(resp.Content)},
@@ -185,7 +185,7 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 
 	children := make([]ID, 0, len(resp.ToolCalls))
 	for _, tc := range resp.ToolCalls {
-		h.emit(in.SubmissionID, agent.Event{Type: agent.EventToolCall, ToolCall: &agent.ToolCallEvent{ID: tc.ID, Name: tc.Name, Arguments: tc.Arguments}})
+		h.emit(rt.ConversationID(), agent.Event{Type: agent.EventToolCall, ToolCall: &agent.ToolCallEvent{ID: tc.ID, Name: tc.Name, Arguments: tc.Arguments}})
 		taskID, err := rt.MintID()
 		if err != nil {
 			return NextState{}, err
@@ -341,7 +341,7 @@ func (toolTaskDef) Step(ctx context.Context, checkpoint json.RawMessage, rt *Tas
 	}
 
 	appendToolResultEntry(rt, entryID, in.CallID, in.Name, content)
-	rt.Harness().emit(in.SubmissionID, agent.Event{Type: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{ID: in.CallID, Name: in.Name, Result: evResult, Error: evErr}})
+	rt.Harness().emit(rt.ConversationID(), agent.Event{Type: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{ID: in.CallID, Name: in.Name, Result: evResult, Error: evErr}})
 	return NextState{
 		Status:  TaskTerminal,
 		Outcome: &Outcome{Status: OutcomeCompleted, Result: mustJSON(content)},
@@ -413,7 +413,7 @@ func toolRestartLimitResult(rt *TaskRuntime, in toolInput) (NextState, error) {
 	}
 	msg := fmt.Sprintf("Tool %s was interrupted %s; it is not run again", in.Name, cutOffCount(rt.Restarts()))
 	appendToolResultEntry(rt, entryID, in.CallID, in.Name, msg)
-	rt.Harness().emit(in.SubmissionID, agent.Event{Type: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{ID: in.CallID, Name: in.Name, Error: msg}})
+	rt.Harness().emit(rt.ConversationID(), agent.Event{Type: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{ID: in.CallID, Name: in.Name, Error: msg}})
 	return NextState{
 		Status:  TaskTerminal,
 		Outcome: &Outcome{Status: OutcomeFailed, Error: &OutcomeError{Message: msg}},
@@ -429,7 +429,7 @@ func abortToolResult(rt *TaskRuntime, in toolInput) (NextState, error) {
 		return NextState{}, err
 	}
 	appendToolResultEntry(rt, entryID, in.CallID, in.Name, abortedToolResult)
-	rt.Harness().emit(in.SubmissionID, agent.Event{Type: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{ID: in.CallID, Name: in.Name, Error: abortedToolResult}})
+	rt.Harness().emit(rt.ConversationID(), agent.Event{Type: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{ID: in.CallID, Name: in.Name, Error: abortedToolResult}})
 	return NextState{Status: TaskTerminal, Outcome: &Outcome{Status: OutcomeAborted}}, nil
 }
 

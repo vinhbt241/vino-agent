@@ -65,8 +65,14 @@ type Harness struct {
 	exts         map[string]Extension
 	restartLimit int
 
-	sinkMu sync.Mutex
-	sinks  map[ID]agent.EventSink
+	eventMu sync.Mutex
+	// submitSinks streams one run's events to the client that started it,
+	// keyed by submission ID (a storage-minted ID).
+	submitSinks map[ID]map[uint64]agent.EventSink
+	// watchSinks holds WatchEvents subscribers, keyed by a harness-local
+	// counter — a separate namespace from storage-minted submission IDs.
+	watchSinks  map[ID]map[uint64]agent.EventSink
+	eventSubSeq uint64
 
 	abortMu     sync.Mutex
 	abortCancel map[ID]context.CancelFunc
@@ -135,7 +141,8 @@ func Open(ctx context.Context, storage Storage, opts HarnessOptions) (*Harness, 
 		docs:         docs,
 		exts:         exts,
 		restartLimit: resolveRestartLimit(opts.RestartLimit),
-		sinks:        make(map[ID]agent.EventSink),
+		submitSinks:  make(map[ID]map[uint64]agent.EventSink),
+		watchSinks:   make(map[ID]map[uint64]agent.EventSink),
 		abortCancel:  make(map[ID]context.CancelFunc),
 	}
 	h.scheduler = NewScheduler(session, h, defs)
@@ -256,7 +263,7 @@ func (h *Harness) Start(ctx context.Context, in StartInput, sink agent.EventSink
 		if ex, err := h.session.storage.SubmissionByRequest(ctx, in.RequestID); err != nil {
 			return nil, err
 		} else if ex != nil {
-			h.registerSink(ex.ID, sink)
+			h.registerSink(ex.ConversationID, ex.ID, sink)
 			return &Submission{h: h, rec: ex, resumed: true}, nil
 		}
 	}
@@ -333,7 +340,7 @@ func (h *Harness) Start(ctx context.Context, in StartInput, sink agent.EventSink
 	if err != nil {
 		return nil, err
 	}
-	h.registerSink(sub.ID, sink)
+	h.registerSink(sub.ConversationID, sub.ID, sink)
 	return &Submission{h: h, rec: sub, resumed: resumed}, nil
 }
 
@@ -523,34 +530,82 @@ func (f toolFilter) Call(ctx context.Context, name string, args json.RawMessage)
 
 // ---- event sinks ----
 
-func (h *Harness) registerSink(submissionID ID, sink agent.EventSink) {
+func (h *Harness) registerSink(conversationID, submissionID ID, sink agent.EventSink) {
 	if sink == nil {
 		return
 	}
-	h.sinkMu.Lock()
-	h.sinks[submissionID] = sink
-	h.sinkMu.Unlock()
+	h.eventMu.Lock()
+	if h.submitSinks[conversationID] == nil {
+		h.submitSinks[conversationID] = make(map[uint64]agent.EventSink)
+	}
+	h.submitSinks[conversationID][uint64(submissionID)] = sink
+	h.eventMu.Unlock()
 }
 
-func (h *Harness) unregisterSink(submissionID ID) {
-	h.sinkMu.Lock()
-	delete(h.sinks, submissionID)
-	h.sinkMu.Unlock()
+func (h *Harness) unregisterSink(conversationID, submissionID ID) {
+	h.eventMu.Lock()
+	if subs := h.submitSinks[conversationID]; subs != nil {
+		delete(subs, uint64(submissionID))
+		if len(subs) == 0 {
+			delete(h.submitSinks, conversationID)
+		}
+	}
+	h.eventMu.Unlock()
 }
 
-// emit delivers one run event to the submission's sink, if any. A sink error
-// (e.g. the client disconnected) detaches the sink and does not abort the
+// subscribeEvents registers fn as a conversation-scoped live-event subscriber
+// and returns an idempotent cancel. It backs Conversation.WatchEvents.
+func (h *Harness) subscribeEvents(conversationID ID, fn agent.EventSink) func() {
+	h.eventMu.Lock()
+	h.eventSubSeq++
+	id := h.eventSubSeq
+	if h.watchSinks[conversationID] == nil {
+		h.watchSinks[conversationID] = make(map[uint64]agent.EventSink)
+	}
+	h.watchSinks[conversationID][id] = fn
+	h.eventMu.Unlock()
+	return func() {
+		h.removeWatchSink(conversationID, id)
+	}
+}
+
+func (h *Harness) removeWatchSink(conversationID ID, id uint64) {
+	h.eventMu.Lock()
+	if subs := h.watchSinks[conversationID]; subs != nil {
+		delete(subs, id)
+		if len(subs) == 0 {
+			delete(h.watchSinks, conversationID)
+		}
+	}
+	h.eventMu.Unlock()
+}
+
+// emit delivers one run event to every subscriber of the conversation — both
+// the submit-stream sinks and the WatchEvents subscribers. A sink error (e.g.
+// the client disconnected) detaches that subscriber and does not abort the
 // run: a durable run must complete and persist a consistent transcript even
 // when nobody is watching.
-func (h *Harness) emit(submissionID ID, ev agent.Event) {
-	h.sinkMu.Lock()
-	sink := h.sinks[submissionID]
-	h.sinkMu.Unlock()
-	if sink == nil {
-		return
+func (h *Harness) emit(conversationID ID, ev agent.Event) {
+	h.eventMu.Lock()
+	submit := make(map[uint64]agent.EventSink, len(h.submitSinks[conversationID]))
+	for id, sink := range h.submitSinks[conversationID] {
+		submit[id] = sink
 	}
-	if err := sink(ev); err != nil {
-		h.unregisterSink(submissionID)
+	watch := make(map[uint64]agent.EventSink, len(h.watchSinks[conversationID]))
+	for id, sink := range h.watchSinks[conversationID] {
+		watch[id] = sink
+	}
+	h.eventMu.Unlock()
+
+	for id, sink := range submit {
+		if err := sink(ev); err != nil {
+			h.unregisterSink(conversationID, ID(id))
+		}
+	}
+	for id, sink := range watch {
+		if err := sink(ev); err != nil {
+			h.removeWatchSink(conversationID, id)
+		}
 	}
 }
 
@@ -568,11 +623,13 @@ func (h *Harness) onTaskFault(ctx context.Context, task *TaskRecord, msg string)
 }
 
 func (h *Harness) settleUnanswered(ctx context.Context, submissionID ID, reason string) {
+	var conversationID ID
 	err := h.session.Commit(ctx, func(tx *Tx) error {
 		sub, err := tx.Submission(ctx, submissionID)
 		if err != nil || sub == nil {
 			return err
 		}
+		conversationID = sub.ConversationID
 		if sub.Status == SubmissionDone || sub.Status == SubmissionUnanswered {
 			return nil // already settled
 		}
@@ -582,7 +639,7 @@ func (h *Harness) settleUnanswered(ctx context.Context, submissionID ID, reason 
 		tx.WriteSubmission(&updated)
 		return nil
 	})
-	if err == nil {
-		h.unregisterSink(submissionID)
+	if err == nil && conversationID != 0 {
+		h.unregisterSink(conversationID, submissionID)
 	}
 }

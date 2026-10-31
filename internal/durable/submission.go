@@ -167,7 +167,7 @@ func (c *Conversation) SubmitStream(ctx context.Context, in SubmitInput, sink ag
 		if ex, err := c.h.session.storage.SubmissionByRequest(ctx, in.RequestID); err != nil {
 			return nil, err
 		} else if ex != nil {
-			c.h.registerSink(ex.ID, sink)
+			c.h.registerSink(ex.ConversationID, ex.ID, sink)
 			return &Submission{h: c.h, rec: ex, resumed: true}, nil
 		}
 	}
@@ -246,7 +246,7 @@ func (c *Conversation) SubmitStream(ctx context.Context, in SubmitInput, sink ag
 	if err != nil {
 		return nil, err
 	}
-	c.h.registerSink(sub.ID, sink)
+	c.h.registerSink(sub.ConversationID, sub.ID, sink)
 	return &Submission{h: c.h, rec: sub, resumed: resumed}, nil
 }
 
