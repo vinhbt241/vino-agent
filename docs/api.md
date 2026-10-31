@@ -148,6 +148,100 @@ conversation's transcript in order.
 | `404` | Unknown conversation, or the internal root conversation (`1`). |
 | `400` | Malformed `{id}`, or the same body errors as `POST /runs`. |
 
+### `GET /conversations/{id}/view`
+
+One conversation's committed snapshot (the multiplayer view): the
+conversation record, its entries, documents, and submissions, plus the commit
+sequence (`seq`) the snapshot reflects. A client reads this first, then opens
+`/watch?after=<seq>` to follow changes with no gap.
+
+**Response `200`**
+
+```json
+{
+  "seq": "42",
+  "conversation": {
+    "id": "12",
+    "parent": {"conversationId": "3", "at": "40"},
+    "owner": {"conversationId": "3", "taskId": "41"},
+    "agent": {"model": "", "systemPrompt": "", "tools": [], "extensions": []}
+  },
+  "entries": [
+    {"id": "10", "kind": "user", "message": {"role": "user", "content": "hi"}}
+  ],
+  "documents": [
+    {"id": "20", "name": "plan", "value": {"n": 1}}
+  ],
+  "submissions": [
+    {"id": "14", "requestId": "job-1", "type": "input", "status": "done", "entryId": "10", "answerId": "11"}
+  ]
+}
+```
+
+- `seq` is a decimal string (the commit sequence).
+- `conversation.agent` always present; its fields are omitted when empty.
+- `entries[]` uses the same shape as `GET /conversations/{id}`.
+- `documents[].value` is the document's raw JSON value; omitted when empty.
+- `submissions[]` fields `requestId`, `entryId`, `answerId`, and `reason` are
+  omitted when empty.
+
+**Errors**
+
+| Status | When |
+|---|---|
+| `404` | Unknown conversation, or the internal root conversation (`1`). |
+| `400` | `{id}` is not a numeric ID. |
+
+### `GET /conversations/{id}/watch`
+
+Stream the conversation's committed changes as SSE, catching up from
+`?after=<seq>` then following live commits. `after` is required — pass the
+`seq` from `/view`. Each frame is one atomic commit batch.
+
+**Query params**
+
+| Param | Meaning |
+|---|---|
+| `after` | (required) Commit sequence to resume from, as a decimal string. |
+
+**Response `200`** — `Content-Type: text/event-stream`, one frame per commit:
+
+```
+event: commit
+data: {"seq":"43","writes":[{"type":"entry","record":{"id":"11","kind":"assistant","message":{"role":"assistant","content":"hi"}}}]}
+```
+
+- `writes[]` carries only the conversation's own `conversation`/`entry`/
+  `document`/`submission` writes (never tasks).
+- Each write is `{"type": "<kind>", "record": {…}}` where `record` is the
+  same DTO that kind uses elsewhere.
+
+**Errors**
+
+| Status | When |
+|---|---|
+| `409` | `after` predates the retained commit window — re-read `/view` and retry with its `seq`. |
+| `404` | Unknown conversation, or the internal root conversation (`1`). |
+| `400` | Malformed `{id}`, missing `after`, or `after` is not a non-negative integer. |
+
+### `GET /conversations/{id}/events`
+
+Stream the conversation's **live** run events as SSE (multi-client fan-out of
+`text_delta` / `tool_call_started` / `tool_result` / `run_finished`). There is
+no `?after` and no replay — events are delivered as they happen. Read `/view`
+first for the committed state.
+
+**Response `200`** — `Content-Type: text/event-stream`. Event names and data
+are the run events described in [SSE events](#sse-events), minus the leading
+`run_started`.
+
+**Errors**
+
+| Status | When |
+|---|---|
+| `404` | Unknown conversation, or the internal root conversation (`1`). |
+| `400` | `{id}` is not a numeric ID. |
+
 ## SSE events
 
 Events arrive in this order: a leading `run_started`, then zero or more

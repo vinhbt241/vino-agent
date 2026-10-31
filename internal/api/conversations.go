@@ -111,11 +111,7 @@ func (s *Server) toConversationDTO(ctx context.Context, conv durable.Conversatio
 func toEntries(entries []durable.EntryRecord) []entryDTO {
 	out := make([]entryDTO, 0, len(entries))
 	for _, e := range entries {
-		dto := entryDTO{ID: formatID(e.ID), Kind: e.Kind}
-		if len(e.Model) > 0 {
-			dto.Message = e.Model[0]
-		}
-		out = append(out, dto)
+		out = append(out, toEntryDTO(e))
 	}
 	return out
 }

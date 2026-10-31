@@ -72,6 +72,9 @@ func newServer(harness *durable.Harness, cors CORSConfig) *Server {
 	mux.HandleFunc("GET /conversations", s.handleListConversations)
 	mux.HandleFunc("GET /conversations/{id}", s.handleGetConversation)
 	mux.HandleFunc("POST /conversations/{id}/runs", s.handleResumeConversation)
+	mux.HandleFunc("GET /conversations/{id}/view", s.handleViewConversation)
+	mux.HandleFunc("GET /conversations/{id}/watch", s.handleWatchConversation)
+	mux.HandleFunc("GET /conversations/{id}/events", s.handleWatchConversationEvents)
 	s.handler = corsMiddleware(cors, mux)
 	return s
 }

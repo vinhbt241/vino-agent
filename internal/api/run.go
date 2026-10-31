@@ -115,9 +115,7 @@ func (s *Server) handleResumeConversation(w http.ResponseWriter, r *http.Request
 // terminal state to SSE events. It is shared by handleRun and
 // handleResumeConversation.
 func (s *Server) streamSubmission(w http.ResponseWriter, r *http.Request, create func(sink agent.EventSink) (*durable.Submission, error)) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	sseHeaders(w)
 	w.WriteHeader(http.StatusOK)
 
 	flusher, ok := w.(http.Flusher)
@@ -286,6 +284,15 @@ type runStartedDTO struct {
 	ConversationID string `json:"conversationId"`
 	SubmissionID   string `json:"submissionId"`
 	Resumed        bool   `json:"resumed"`
+}
+
+// sseHeaders sets the headers every SSE endpoint shares. It does not write
+// the status line, so callers can still choose a non-200 status before any
+// frame is written.
+func sseHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
 }
 
 // writeSSE writes one SSE event frame and flushes it to the client.
