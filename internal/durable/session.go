@@ -19,7 +19,14 @@ var (
 	// ErrDocumentUndeclared is returned when a document name has no
 	// DocumentDefinition in the harness options.
 	ErrDocumentUndeclared = errors.New("durable: document is not declared")
+	// ErrWatchSeqExpired is returned when a Watch starts after a sequence
+	// older than the retained commit window; the caller must re-View.
+	ErrWatchSeqExpired = errors.New("durable: watch seq expired")
 )
+
+// retainCommitsDefault is the default Watch catch-up window: the number of
+// most-recent commits Session retains for catch-up.
+const retainCommitsDefault = 1024
 
 // Session owns the mutation line: one writer at a time, atomic commits across
 // all records. A storage error is fatal to the session; the host reopens the
@@ -28,9 +35,11 @@ type Session struct {
 	storage Storage
 	mu      sync.Mutex
 	lastSeq Seq
-	// commits retains every commit since open (ascending Seq) for Watch
-	// catch-up; the SQLite/working-set slice bounds this.
+	// commits retains the most recent commits (ascending Seq) for Watch
+	// catch-up, bounded by retainCommits.
 	commits []CommitOp
+	// retainCommits is the commit-catch-up window size.
+	retainCommits int
 	// watchers are active commit watchers, drained asynchronously so a slow
 	// watcher never stalls the mutation line.
 	watchers []*commitWatcher
@@ -38,7 +47,7 @@ type Session struct {
 
 // OpenSession opens a session over a storage backend.
 func OpenSession(storage Storage) *Session {
-	return &Session{storage: storage}
+	return &Session{storage: storage, retainCommits: retainCommitsDefault}
 }
 
 // Storage returns the backend the session writes through.
@@ -80,6 +89,9 @@ func (s *Session) commitLocked(ctx context.Context, writes []StorageWrite) error
 	s.lastSeq = seq
 	op := CommitOp{Seq: seq, Writes: cloneWrites(writes)}
 	s.commits = append(s.commits, op)
+	if n := len(s.commits) - s.retainCommits; n > 0 {
+		s.commits = s.commits[n:]
+	}
 	s.publishLocked(op)
 	return nil
 }
@@ -112,13 +124,17 @@ type commitWatcher struct {
 // commits. Registration and catch-up selection happen under the mutation lock,
 // so a commit can never slip between a snapshot and its subscription. The
 // returned cancel is idempotent.
-func (s *Session) Watch(after Seq, match func(StorageWrite) bool, fn func(CommitOp) error) func() {
+func (s *Session) Watch(after Seq, match func(StorageWrite) bool, fn func(CommitOp) error) (func(), error) {
 	if match == nil {
 		match = func(StorageWrite) bool { return true }
 	}
 	w := &commitWatcher{match: match, ch: make(chan CommitOp, watchBuffer), done: make(chan struct{})}
 
 	s.mu.Lock()
+	if len(s.commits) > 0 && after < s.commits[0].Seq {
+		s.mu.Unlock()
+		return nil, ErrWatchSeqExpired
+	}
 	s.watchers = append(s.watchers, w)
 	var backlog []CommitOp
 	for _, c := range s.commits {
@@ -139,7 +155,7 @@ func (s *Session) Watch(after Seq, match func(StorageWrite) bool, fn func(Commit
 			s.mu.Lock()
 			s.detachLocked(w)
 			s.mu.Unlock()
-			return func() {}
+			return func() {}, nil
 		}
 	}
 
@@ -164,7 +180,7 @@ func (s *Session) Watch(after Seq, match func(StorageWrite) bool, fn func(Commit
 		s.mu.Lock()
 		s.detachLocked(w)
 		s.mu.Unlock()
-	}
+	}, nil
 }
 
 // publishLocked delivers one commit op to every watcher it matches, detaching

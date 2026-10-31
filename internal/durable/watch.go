@@ -73,7 +73,7 @@ func (c *Conversation) Watch(ctx context.Context, after Seq, fn func(CommitOp) e
 	} else if conv == nil {
 		return nil, ErrConversationNotFound
 	}
-	return c.h.session.Watch(after, func(w StorageWrite) bool { return viewWrite(c.id, w) }, fn), nil
+	return c.h.session.Watch(after, func(w StorageWrite) bool { return viewWrite(c.id, w) }, fn)
 }
 
 // WatchEvents subscribes fn to the conversation's live run events. fn is

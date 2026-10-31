@@ -323,6 +323,29 @@ func TestConformanceJSONL(t *testing.T) {
 	)
 }
 
+func TestConformanceSQLite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.db")
+	runConformance(t,
+		func(t *testing.T) Storage {
+			s, err := OpenSQLite(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s
+		},
+		func(t *testing.T, cur Storage) Storage {
+			if err := cur.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			s, err := OpenSQLite(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s
+		},
+	)
+}
+
 func mustID(t *testing.T, s Storage, ctx context.Context) ID {
 	t.Helper()
 	id, err := s.MintID(ctx)

@@ -693,6 +693,101 @@ func TestWatchLiveClonesDeliveredWrites(t *testing.T) {
 	}
 }
 
+func TestWatchSeqExpired(t *testing.T) {
+	ctx := context.Background()
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: &fakeLLM{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.session.retainCommits = 1
+
+	convID := mint(t, h.session.storage, ctx)
+	commitSession(t, h, ctx, []StorageWrite{
+		{Type: WriteConversation, Value: &ConversationRecord{ID: RootConversationID}},
+		{Type: WriteConversation, Value: &ConversationRecord{ID: convID}},
+	})
+	c, err := h.Conversation(ctx, convID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := c.View(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entryID := mint(t, h.session.storage, ctx)
+	commitSession(t, h, ctx, []StorageWrite{
+		{Type: WriteEntry, Value: &EntryRecord{ID: entryID, ConversationID: convID, Kind: kindUser, Model: []agent.Message{{Role: agent.RoleUser, Content: "hi"}}}},
+	})
+
+	// The commit v.Seq reflects has been evicted; watching after it expires.
+	cancel, err := c.Watch(ctx, v.Seq, func(op CommitOp) error { return nil })
+	if !errors.Is(err, ErrWatchSeqExpired) {
+		t.Fatalf("Watch(after=%d) err = %v, want ErrWatchSeqExpired", v.Seq, err)
+	}
+	if cancel != nil {
+		t.Fatalf("Watch(after=%d) returned non-nil cancel, want nil", v.Seq)
+	}
+}
+
+func TestWatchWithinWindowStillCatchesUp(t *testing.T) {
+	ctx := context.Background()
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: &fakeLLM{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.session.retainCommits = 2
+
+	convID := mint(t, h.session.storage, ctx)
+	commitSession(t, h, ctx, []StorageWrite{
+		{Type: WriteConversation, Value: &ConversationRecord{ID: RootConversationID}},
+		{Type: WriteConversation, Value: &ConversationRecord{ID: convID}},
+	})
+	c, err := h.Conversation(ctx, convID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entryA := mint(t, h.session.storage, ctx)
+	commitSession(t, h, ctx, []StorageWrite{
+		{Type: WriteEntry, Value: &EntryRecord{ID: entryA, ConversationID: convID, Kind: kindUser, Model: []agent.Message{{Role: agent.RoleUser, Content: "a"}}}},
+	})
+	v, err := c.View(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entryB := mint(t, h.session.storage, ctx)
+	commitSession(t, h, ctx, []StorageWrite{
+		{Type: WriteEntry, Value: &EntryRecord{ID: entryB, ConversationID: convID, Kind: kindUser, Model: []agent.Message{{Role: agent.RoleUser, Content: "b"}}}},
+	})
+
+	// The window still holds v.Seq; watching after it delivers only entryB.
+	ops := make(chan CommitOp, 8)
+	cancel, err := c.Watch(ctx, v.Seq, func(op CommitOp) error {
+		ops <- op
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+
+	select {
+	case op := <-ops:
+		if len(op.Writes) != 1 || op.Writes[0].Value.(*EntryRecord).ID != entryB {
+			t.Fatalf("caught up op = %v, want entry %d only", op, entryB)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for catch-up within window")
+	}
+
+	select {
+	case op := <-ops:
+		t.Fatalf("unexpected extra op %v", op)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestWatchEventsNilFnErrors(t *testing.T) {
 	ctx := context.Background()
 	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: &fakeLLM{}})
