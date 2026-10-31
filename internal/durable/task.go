@@ -7,12 +7,14 @@ import (
 )
 
 // NextState is the durable state a task step commits: a replacement
-// checkpoint, a wait on child tasks, or a terminal outcome.
+// checkpoint, a wait on child tasks, or a terminal outcome. Settle carries a
+// submission settlement the scheduler applies atomically with the commit.
 type NextState struct {
 	Status     TaskStatus
 	Checkpoint json.RawMessage
 	On         []ID
 	Outcome    *Outcome
+	Settle     *SettleIntent
 }
 
 // TaskDefinition describes a durable state machine. Checkpoints are opaque

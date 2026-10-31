@@ -307,3 +307,9 @@ func (tx *Tx) WriteSubmission(rec *SubmissionRecord) {
 func (tx *Tx) WriteDocument(rec *DocumentRecord) {
 	tx.writes = append(tx.writes, StorageWrite{Type: WriteDocument, Value: rec})
 }
+
+// write stages a pre-built write. It lets a commit closure apply writes that
+// were assembled before the closure opened (e.g. the scheduler's step commit).
+func (tx *Tx) write(w StorageWrite) {
+	tx.writes = append(tx.writes, w)
+}

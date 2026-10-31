@@ -387,13 +387,9 @@ func (c *Conversation) Abort(ctx context.Context) error {
 			return err
 		}
 		for i := range subs.Items {
-			s := subs.Items[i]
-			if s.Status == SubmissionDone || s.Status == SubmissionUnanswered {
-				continue
+			if err := c.h.settlement.ApplyUnanswered(ctx, tx, subs.Items[i].ID, "aborted"); err != nil {
+				return err
 			}
-			s.Status = SubmissionUnanswered
-			s.Reason = "aborted"
-			tx.WriteSubmission(&s)
 		}
 		return nil
 	}); err != nil {

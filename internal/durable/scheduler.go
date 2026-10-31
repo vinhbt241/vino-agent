@@ -202,7 +202,7 @@ func (sch *Scheduler) runOne(execCtx, durableCtx context.Context, task *TaskReco
 
 	// Reserve: pending -> running, checkpoint preserved. This is the durable
 	// intent that a crash re-invokes.
-	if err := sch.commitState(durableCtx, task, TaskRunning, task.State.Checkpoint, nil, nil, nil); err != nil {
+	if err := sch.commitState(durableCtx, task, TaskRunning, task.State.Checkpoint, nil, nil, nil, nil); err != nil {
 		return err
 	}
 
@@ -222,7 +222,7 @@ func (sch *Scheduler) runOne(execCtx, durableCtx context.Context, task *TaskReco
 		}
 
 		writes := append([]StorageWrite(nil), rt.writes...)
-		if err := sch.commitState(durableCtx, cur, next.Status, next.Checkpoint, next.On, next.Outcome, rt.memos, writes...); err != nil {
+		if err := sch.commitState(durableCtx, cur, next.Status, next.Checkpoint, next.On, next.Outcome, rt.memos, next.Settle, writes...); err != nil {
 			return err
 		}
 
@@ -246,7 +246,7 @@ func noProgress(oldCheckpoint, newCheckpoint []byte, writes []StorageWrite) bool
 
 // commitState replaces a task's state atomically with any accumulated writes
 // and staged memos.
-func (sch *Scheduler) commitState(ctx context.Context, cur *TaskRecord, status TaskStatus, checkpoint json.RawMessage, on []ID, outcome *Outcome, memos map[string]json.RawMessage, writes ...StorageWrite) error {
+func (sch *Scheduler) commitState(ctx context.Context, cur *TaskRecord, status TaskStatus, checkpoint json.RawMessage, on []ID, outcome *Outcome, memos map[string]json.RawMessage, settle *SettleIntent, writes ...StorageWrite) error {
 	updated := *cur
 	updated.State = TaskState{Status: status, Checkpoint: checkpoint, On: on, Outcome: outcome}
 	// Real progress (a new checkpoint, a wait, or an outcome) removes the
@@ -265,8 +265,16 @@ func (sch *Scheduler) commitState(ctx context.Context, cur *TaskRecord, status T
 		}
 		updated.Memos = nm
 	}
-	writes = append(writes, StorageWrite{Type: WriteTask, Value: &updated})
-	return sch.session.CommitWrites(ctx, writes)
+	all := append(append([]StorageWrite(nil), writes...), StorageWrite{Type: WriteTask, Value: &updated})
+	return sch.session.Commit(ctx, func(tx *Tx) error {
+		for _, w := range all {
+			tx.write(w)
+		}
+		if settle != nil {
+			return sch.harness.settlement.ApplyDone(ctx, tx, settle.SubmissionID, settle.AnswerID)
+		}
+		return nil
+	})
 }
 
 // isProgress reports whether a committed state counts as durable progress: a

@@ -196,12 +196,12 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, cp gener
 	if len(resp.ToolCalls) == 0 {
 		final := agent.Message{Role: agent.RoleAssistant, Content: resp.Content}
 		appendAssistantEntry(rt, assistantID, final, nil)
-		settleSubmission(rt, in.SubmissionID, assistantID)
 		h.emit(rt.ConversationID(), agent.Event{Type: agent.EventRunFinished, RunFinished: &agent.RunFinishedEvent{FinalMessage: final}})
 		h.unregisterSink(rt.ConversationID(), in.SubmissionID)
 		return NextState{
 			Status:  TaskTerminal,
 			Outcome: &Outcome{Status: OutcomeCompleted, Result: mustJSON(resp.Content)},
+			Settle:  doneIntent(in.SubmissionID, assistantID),
 		}, nil
 	}
 
@@ -265,23 +265,14 @@ func (g generationTask) endCutOff(rt *TaskRuntime, checkpoint json.RawMessage) (
 	}, nil
 }
 
-// settleSubmission marks the answered submission done, pointing at the
-// assistant entry that answered it.
-func settleSubmission(rt *TaskRuntime, submissionID ID, answerID ID) {
+// doneIntent builds the settlement intent the generation step's terminal
+// commit applies: mark the answered submission done, atomically with the task
+// outcome. A zero submission ID (no host submission) yields no intent.
+func doneIntent(submissionID, answerID ID) *SettleIntent {
 	if submissionID == 0 {
-		return
+		return nil
 	}
-	sub, err := rt.Submission(submissionID)
-	if err != nil || sub == nil {
-		return
-	}
-	if sub.Status == SubmissionDone || sub.Status == SubmissionUnanswered {
-		return // already settled: a concurrent abort wins over a late answer
-	}
-	updated := *sub
-	updated.Status = SubmissionDone
-	updated.AnswerID = &answerID
-	rt.AppendSubmission(&updated)
+	return &SettleIntent{SubmissionID: submissionID, AnswerID: answerID}
 }
 
 // abort settles the submission as unanswered and ends the generation task

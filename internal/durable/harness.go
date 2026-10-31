@@ -64,6 +64,7 @@ type Harness struct {
 	docs         map[string]DocumentDefinition
 	exts         map[string]Extension
 	restartLimit int
+	settlement   settlement
 
 	eventMu sync.Mutex
 	// submitSinks streams one run's events to the client that started it,
@@ -145,6 +146,7 @@ func Open(ctx context.Context, storage Storage, opts HarnessOptions) (*Harness, 
 		docs:         docs,
 		exts:         exts,
 		restartLimit: resolveRestartLimit(opts.RestartLimit),
+		settlement:   settlement{session: session},
 		submitSinks:  make(map[ID]map[uint64]agent.EventSink),
 		watchSinks:   make(map[ID]map[uint64]agent.EventSink),
 		abortCancel:  make(map[ID]context.CancelFunc),
@@ -669,22 +671,7 @@ func (h *Harness) onTaskFault(ctx context.Context, task *TaskRecord, msg string)
 }
 
 func (h *Harness) settleUnanswered(ctx context.Context, submissionID ID, reason string) {
-	var conversationID ID
-	err := h.session.Commit(ctx, func(tx *Tx) error {
-		sub, err := tx.Submission(ctx, submissionID)
-		if err != nil || sub == nil {
-			return err
-		}
-		conversationID = sub.ConversationID
-		if sub.Status == SubmissionDone || sub.Status == SubmissionUnanswered {
-			return nil // already settled
-		}
-		updated := *sub
-		updated.Status = SubmissionUnanswered
-		updated.Reason = reason
-		tx.WriteSubmission(&updated)
-		return nil
-	})
+	conversationID, err := h.settlement.SettleUnanswered(ctx, submissionID, reason)
 	if err == nil && conversationID != 0 {
 		h.unregisterSink(conversationID, submissionID)
 	}
