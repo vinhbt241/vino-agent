@@ -3,6 +3,7 @@ package durable
 import (
 	"context"
 	"encoding/json"
+	"errors"
 )
 
 // NextState is the durable state a task step commits: a replacement
@@ -41,6 +42,9 @@ type TaskRuntime struct {
 	// for the same name replaces the staged value instead of minting a second
 	// ID and tripping name-uniqueness validation.
 	docs map[string]*DocumentRecord
+	// memos holds memos staged this step by key (first-writer-wins against the
+	// committed rt.task.Memos); it merges into the step's checkpoint commit.
+	memos map[string]json.RawMessage
 }
 
 func (rt *TaskRuntime) TaskID() ID             { return rt.task.ID }
@@ -122,6 +126,31 @@ func (rt *TaskRuntime) SetDocument(name string, value json.RawMessage) error {
 	rt.docs[name] = rec
 	rt.AppendDocument(rec)
 	return nil
+}
+
+// Memo stages a small first-writer-wins value in the task envelope, committed
+// atomically with the step's checkpoint. It returns true only when this call
+// staged the first value for key (absent from committed Memos and from this
+// step's staged memos), so a task or hook that re-runs after a crash can
+// branch on it instead of re-asking. The error return is reserved (nil today).
+func (rt *TaskRuntime) Memo(key string, value json.RawMessage) (bool, error) {
+	if key == "" {
+		return false, errors.New("durable: empty memo key")
+	}
+	if _, ok := rt.task.Memos[key]; ok {
+		return false, nil
+	}
+	if _, ok := rt.memos[key]; ok {
+		return false, nil
+	}
+	rt.memos[key] = value
+	return true, nil
+}
+
+// MemoValue returns a memo's committed value, or nil when absent. Memos
+// staged this step are not visible until the commit lands.
+func (rt *TaskRuntime) MemoValue(key string) json.RawMessage {
+	return rt.task.Memos[key]
 }
 
 // AppendDocument stages a document write for the step's atomic commit.

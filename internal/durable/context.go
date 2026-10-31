@@ -18,6 +18,13 @@ func (h *Harness) contextMessages(ctx context.Context, conversationID ID, system
 	if systemPrompt == "" {
 		systemPrompt = h.systemPrompt
 	}
+	for _, s := range h.extensionSections(ctx, conversationID) {
+		if systemPrompt == "" {
+			systemPrompt = s
+		} else {
+			systemPrompt += "\n\n" + s
+		}
+	}
 	if systemPrompt != "" {
 		msgs = append(msgs, agent.Message{Role: agent.RoleSystem, Content: systemPrompt})
 	}

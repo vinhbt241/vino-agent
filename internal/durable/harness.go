@@ -16,6 +16,16 @@ import (
 // to this default.
 const defaultRestartLimit = 5
 
+// Extension is a named bundle of system-prompt sections, tools, and tasks.
+// Conversations reference extensions by name only, so after a restart they
+// pick up whatever the new process installs.
+type Extension struct {
+	Name         string
+	Tools        agent.ToolRegistry
+	Tasks        []TaskDefinition
+	SystemPrompt []string
+}
+
 // HarnessOptions wires a harness to the application's model, tools, and any
 // additional task definitions.
 type HarnessOptions struct {
@@ -30,6 +40,9 @@ type HarnessOptions struct {
 	// Documents declares the named documents every conversation can hold: their
 	// default value and fork mode.
 	Documents []DocumentDefinition
+	// Extensions declares the named extension bundles conversations may
+	// activate (by name) to gain tools, tasks, and system-prompt sections.
+	Extensions []Extension
 	// RestartLimit is the number of consecutive crashes after which a task
 	// ends itself instead of running again. Values <= 0 resolve to the
 	// default (5).
@@ -47,6 +60,7 @@ type Harness struct {
 	models       map[string]agent.LLM
 	defs         []TaskDefinition
 	docs         map[string]DocumentDefinition
+	exts         map[string]Extension
 	restartLimit int
 
 	sinkMu sync.Mutex
@@ -87,6 +101,27 @@ func Open(ctx context.Context, storage Storage, opts HarnessOptions) (*Harness, 
 		docs[d.Name] = d
 	}
 
+	exts := make(map[string]Extension, len(opts.Extensions))
+	for _, e := range opts.Extensions {
+		if e.Name == "" {
+			return nil, errors.New("durable: extension with empty name")
+		}
+		if _, exists := exts[e.Name]; exists {
+			return nil, fmt.Errorf("durable: duplicate extension %q", e.Name)
+		}
+		exts[e.Name] = e
+	}
+	for _, e := range opts.Extensions {
+		defs = append(defs, e.Tasks...)
+	}
+	seenKinds := make(map[string]bool, len(defs))
+	for _, d := range defs {
+		if seenKinds[d.Kind()] {
+			return nil, fmt.Errorf("durable: duplicate task kind %q", d.Kind())
+		}
+		seenKinds[d.Kind()] = true
+	}
+
 	h := &Harness{
 		session:      session,
 		llm:          opts.LLM,
@@ -96,6 +131,7 @@ func Open(ctx context.Context, storage Storage, opts HarnessOptions) (*Harness, 
 		models:       opts.Models,
 		defs:         defs,
 		docs:         docs,
+		exts:         exts,
 		restartLimit: resolveRestartLimit(opts.RestartLimit),
 		sinks:        make(map[ID]agent.EventSink),
 		abortCancel:  make(map[ID]context.CancelFunc),
@@ -310,17 +346,96 @@ func (h *Harness) llmFor(model string) agent.LLM {
 	return h.llm
 }
 
-// toolsFor returns the tool registry for a conversation: the harness registry,
-// filtered to the allow-list when the conversation configures one.
+// toolsFor returns the merged tool registry for a conversation: the base
+// registry (allow-listed when cfg.Tools is set) followed by the active
+// extensions' tools in cfg.Extensions order, where a later definition of a
+// name shadows an earlier one.
 func (h *Harness) toolsFor(cfg AgentConfig) agent.ToolRegistry {
-	if len(cfg.Tools) == 0 || h.tools == nil {
-		return h.tools
+	base := h.tools
+	if len(cfg.Tools) > 0 && base != nil {
+		allow := make(map[string]bool, len(cfg.Tools))
+		for _, n := range cfg.Tools {
+			allow[n] = true
+		}
+		base = toolFilter{base: base, allow: allow}
 	}
-	allow := make(map[string]bool, len(cfg.Tools))
-	for _, n := range cfg.Tools {
-		allow[n] = true
+
+	var exts []agent.ToolRegistry
+	for _, name := range cfg.Extensions {
+		if e, ok := h.exts[name]; ok && e.Tools != nil {
+			exts = append(exts, e.Tools)
+		}
 	}
-	return toolFilter{base: h.tools, allow: allow}
+	if len(exts) == 0 {
+		return base
+	}
+	regs := make([]agent.ToolRegistry, 0, len(exts)+1)
+	regs = append(regs, base)
+	regs = append(regs, exts...)
+	return mergeToolRegistries(regs...)
+}
+
+// mergedTools composes tool registries by name: later registries shadow
+// earlier ones. Specs() returns one spec per name (the winning spec) in a
+// stable order; Call routes to the winning provider.
+type mergedTools struct {
+	specs    []agent.ToolSpec
+	provider map[string]agent.ToolRegistry
+}
+
+// mergeToolRegistries builds a merged registry from registries in priority
+// order (highest last).
+func mergeToolRegistries(regs ...agent.ToolRegistry) agent.ToolRegistry {
+	type item struct {
+		spec agent.ToolSpec
+		reg  agent.ToolRegistry
+	}
+	var list []item
+	index := map[string]int{}
+	for _, reg := range regs {
+		if reg == nil {
+			continue
+		}
+		for _, s := range reg.Specs() {
+			if i, ok := index[s.Name]; ok {
+				list[i] = item{s, reg}
+			} else {
+				index[s.Name] = len(list)
+				list = append(list, item{s, reg})
+			}
+		}
+	}
+	m := &mergedTools{specs: make([]agent.ToolSpec, len(list)), provider: make(map[string]agent.ToolRegistry, len(list))}
+	for i, it := range list {
+		m.specs[i] = it.spec
+		m.provider[it.spec.Name] = it.reg
+	}
+	return m
+}
+
+func (m *mergedTools) Specs() []agent.ToolSpec { return m.specs }
+
+func (m *mergedTools) Call(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	if r, ok := m.provider[name]; ok && r != nil {
+		return r.Call(ctx, name, args)
+	}
+	return "", fmt.Errorf("durable: tool %q is not registered", name)
+}
+
+// extensionSections returns the system-prompt sections of a conversation's
+// active extensions, in activation order, skipping unknown names.
+func (h *Harness) extensionSections(ctx context.Context, conversationID ID) []string {
+	conv, err := h.session.storage.Conversation(ctx, conversationID)
+	if err != nil || conv == nil {
+		return nil
+	}
+	var out []string
+	for _, name := range conv.Agent.Extensions {
+		if e, ok := h.exts[name]; ok {
+			out = append(out, e.SystemPrompt...)
+		}
+	}
+	return out
 }
 
 // toolFilter exposes a subset of a tool registry's specs. Call passes through

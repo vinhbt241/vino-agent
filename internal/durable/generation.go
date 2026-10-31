@@ -111,9 +111,10 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 		return NextState{}, err
 	}
 
+	reg := h.toolsFor(conv.Agent)
 	var specs []agent.ToolSpec
-	if r := h.toolsFor(conv.Agent); r != nil {
-		specs = r.Specs()
+	if reg != nil {
+		specs = reg.Specs()
 	}
 
 	llm := h.llmFor(conv.Agent.Model)
@@ -172,7 +173,7 @@ func (g generationTask) stepModel(ctx context.Context, rt *TaskRuntime, turns in
 			CallID:       tc.ID,
 			Name:         tc.Name,
 			Arguments:    tc.Arguments,
-			ReplaySafe:   replayOf(h.tools, tc.Name) == agent.ReplaySafe,
+			ReplaySafe:   replayOf(reg, tc.Name) == agent.ReplaySafe,
 			SubmissionID: in.SubmissionID,
 			TimeoutMs:    in.ToolTimeoutMs,
 		})
@@ -298,12 +299,24 @@ func (toolTaskDef) Step(ctx context.Context, checkpoint json.RawMessage, rt *Tas
 		return NextState{}, err
 	}
 
+	conv, err := rt.Conversation(rt.ConversationID())
+	if err != nil {
+		return NextState{}, err
+	}
+	if conv == nil {
+		return NextState{}, fmt.Errorf("durable: conversation %d not found", rt.ConversationID())
+	}
+	reg := rt.Harness().toolsFor(conv.Agent)
+
 	var content, evResult, evErr string
 	if rt.Restarts() > 0 && !in.ReplaySafe {
 		content = crashInterruptedToolResult
 		evResult = content
+	} else if reg == nil {
+		content = fmt.Sprintf("tool %q is not registered", in.Name)
+		evErr = content
 	} else {
-		result, callErr := rt.Harness().tools.Call(ctx, in.Name, in.Arguments)
+		result, callErr := reg.Call(ctx, in.Name, in.Arguments)
 		switch {
 		case ctx.Err() != nil:
 			content = abortedToolResult

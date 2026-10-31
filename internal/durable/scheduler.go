@@ -202,7 +202,7 @@ func (sch *Scheduler) runOne(execCtx, durableCtx context.Context, task *TaskReco
 
 	// Reserve: pending -> running, checkpoint preserved. This is the durable
 	// intent that a crash re-invokes.
-	if err := sch.commitState(durableCtx, task, TaskRunning, task.State.Checkpoint, nil, nil); err != nil {
+	if err := sch.commitState(durableCtx, task, TaskRunning, task.State.Checkpoint, nil, nil, nil); err != nil {
 		return err
 	}
 
@@ -215,14 +215,14 @@ func (sch *Scheduler) runOne(execCtx, durableCtx context.Context, task *TaskReco
 			return nil
 		}
 
-		rt := &TaskRuntime{session: sch.session, harness: sch.harness, task: cur, ctx: durableCtx, docs: make(map[string]*DocumentRecord)}
+		rt := &TaskRuntime{session: sch.session, harness: sch.harness, task: cur, ctx: durableCtx, docs: make(map[string]*DocumentRecord), memos: make(map[string]json.RawMessage)}
 		next, err := def.Step(execCtx, cur.State.Checkpoint, rt)
 		if err != nil {
 			return sch.fault(durableCtx, cur, err.Error())
 		}
 
 		writes := append([]StorageWrite(nil), rt.writes...)
-		if err := sch.commitState(durableCtx, cur, next.Status, next.Checkpoint, next.On, next.Outcome, writes...); err != nil {
+		if err := sch.commitState(durableCtx, cur, next.Status, next.Checkpoint, next.On, next.Outcome, rt.memos, writes...); err != nil {
 			return err
 		}
 
@@ -244,8 +244,9 @@ func noProgress(oldCheckpoint, newCheckpoint []byte, writes []StorageWrite) bool
 	return len(writes) == 0 && bytes.Equal(oldCheckpoint, newCheckpoint)
 }
 
-// commitState replaces a task's state atomically with any accumulated writes.
-func (sch *Scheduler) commitState(ctx context.Context, cur *TaskRecord, status TaskStatus, checkpoint json.RawMessage, on []ID, outcome *Outcome, writes ...StorageWrite) error {
+// commitState replaces a task's state atomically with any accumulated writes
+// and staged memos.
+func (sch *Scheduler) commitState(ctx context.Context, cur *TaskRecord, status TaskStatus, checkpoint json.RawMessage, on []ID, outcome *Outcome, memos map[string]json.RawMessage, writes ...StorageWrite) error {
 	updated := *cur
 	updated.State = TaskState{Status: status, Checkpoint: checkpoint, On: on, Outcome: outcome}
 	// Real progress (a new checkpoint, a wait, or an outcome) removes the
@@ -253,6 +254,16 @@ func (sch *Scheduler) commitState(ctx context.Context, cur *TaskRecord, status T
 	// (pending -> running, same checkpoint) is not progress.
 	if isProgress(cur, status, checkpoint) {
 		updated.Restarts = 0
+	}
+	if len(memos) > 0 {
+		nm := make(map[string]json.RawMessage, len(updated.Memos)+len(memos))
+		for k, v := range updated.Memos {
+			nm[k] = v
+		}
+		for k, v := range memos {
+			nm[k] = v
+		}
+		updated.Memos = nm
 	}
 	writes = append(writes, StorageWrite{Type: WriteTask, Value: &updated})
 	return sch.session.CommitWrites(ctx, writes)

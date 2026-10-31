@@ -58,11 +58,13 @@ type DocumentRecord struct {
 }
 
 // AgentConfig is a conversation's agent configuration. Empty fields fall back
-// to the harness defaults.
+// to the harness defaults. Extensions are referenced by name; an unknown name
+// activates nothing.
 type AgentConfig struct {
 	Model        string   `json:"model,omitempty"`
 	SystemPrompt string   `json:"systemPrompt,omitempty"`
 	Tools        []string `json:"tools,omitempty"`
+	Extensions   []string `json:"extensions,omitempty"`
 }
 
 // ConversationRecord is a transcript scope. Parent (fork) and owner (task
