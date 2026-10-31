@@ -560,3 +560,151 @@ func TestSubmitSinkAndWatchEventsCoexist(t *testing.T) {
 		}
 	}
 }
+
+func TestWatchCatchesUpClonesDeliveredWrites(t *testing.T) {
+	ctx := context.Background()
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: &fakeLLM{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	convID := mint(t, h.session.storage, ctx)
+	commitSession(t, h, ctx, []StorageWrite{
+		{Type: WriteConversation, Value: &ConversationRecord{ID: RootConversationID}},
+		{Type: WriteConversation, Value: &ConversationRecord{ID: convID}},
+	})
+	c, err := h.Conversation(ctx, convID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := c.View(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entryID := mint(t, h.session.storage, ctx)
+	commitSession(t, h, ctx, []StorageWrite{
+		{Type: WriteEntry, Value: &EntryRecord{ID: entryID, ConversationID: convID, Kind: kindUser, Model: []agent.Message{{Role: agent.RoleUser, Content: "original"}}}},
+	})
+
+	// The first watcher mutates the delivered entry in place.
+	cancel1, err := c.Watch(ctx, v.Seq, func(op CommitOp) error {
+		for _, w := range op.Writes {
+			if w.Type == WriteEntry {
+				w.Value.(*EntryRecord).Model[0].Content = "mutated"
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel1()
+
+	// A second watcher replaying the same seq must see the original value,
+	// not the mutation the first watcher made.
+	got := make(chan CommitOp, 1)
+	cancel2, err := c.Watch(ctx, v.Seq, func(op CommitOp) error {
+		got <- op
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel2()
+
+	select {
+	case op := <-got:
+		if len(op.Writes) != 1 || op.Writes[0].Value.(*EntryRecord).Model[0].Content != "original" {
+			t.Fatalf("replayed op = %v, want original content (retained history was mutated)", op)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for replay")
+	}
+}
+
+func TestWatchLiveClonesDeliveredWrites(t *testing.T) {
+	ctx := context.Background()
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: &fakeLLM{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	convID := mint(t, h.session.storage, ctx)
+	commitSession(t, h, ctx, []StorageWrite{
+		{Type: WriteConversation, Value: &ConversationRecord{ID: RootConversationID}},
+		{Type: WriteConversation, Value: &ConversationRecord{ID: convID}},
+	})
+	c, err := h.Conversation(ctx, convID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := c.View(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mutated := make(chan struct{})
+	seen := make(chan string, 1)
+
+	cancel1, err := c.Watch(ctx, v.Seq, func(op CommitOp) error {
+		for _, w := range op.Writes {
+			if w.Type == WriteEntry {
+				w.Value.(*EntryRecord).Model[0].Content = "mutated"
+			}
+		}
+		close(mutated)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel1()
+
+	cancel2, err := c.Watch(ctx, v.Seq, func(op CommitOp) error {
+		select {
+		case <-mutated:
+		case <-time.After(2 * time.Second):
+			seen <- "timeout"
+			return nil
+		}
+		for _, w := range op.Writes {
+			if w.Type == WriteEntry {
+				seen <- w.Value.(*EntryRecord).Model[0].Content
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel2()
+
+	entryID := mint(t, h.session.storage, ctx)
+	commitSession(t, h, ctx, []StorageWrite{
+		{Type: WriteEntry, Value: &EntryRecord{ID: entryID, ConversationID: convID, Kind: kindUser, Model: []agent.Message{{Role: agent.RoleUser, Content: "original"}}}},
+	})
+
+	select {
+	case got := <-seen:
+		if got != "original" {
+			t.Fatalf("second watcher saw %q, want original (live delivery shares memory)", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the second watcher")
+	}
+}
+
+func TestWatchEventsNilFnErrors(t *testing.T) {
+	ctx := context.Background()
+	h, err := Open(ctx, NewMemoryStorage(), HarnessOptions{LLM: &fakeLLM{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := h.Root()
+	cancel, err := root.WatchEvents(ctx, nil)
+	if err == nil {
+		t.Fatal("WatchEvents(nil) returned nil error, want error")
+	}
+	if cancel != nil {
+		t.Fatal("WatchEvents(nil) returned non-nil cancel, want nil")
+	}
+}

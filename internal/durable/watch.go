@@ -81,7 +81,7 @@ func (c *Conversation) Watch(ctx context.Context, after Seq, fn func(CommitOp) e
 // subscriber. The returned cancel is idempotent.
 func (c *Conversation) WatchEvents(ctx context.Context, fn agent.EventSink) (func(), error) {
 	if fn == nil {
-		return nil, nil
+		return nil, errors.New("durable: nil watch func")
 	}
 	if conv, err := c.h.session.storage.Conversation(ctx, c.id); err != nil {
 		return nil, err

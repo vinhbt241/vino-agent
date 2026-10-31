@@ -125,7 +125,7 @@ func (s *Session) Watch(after Seq, match func(StorageWrite) bool, fn func(Commit
 		if c.Seq <= after {
 			continue
 		}
-		op := CommitOp{Seq: c.Seq, Writes: filterWrites(c.Writes, match)}
+		op := CommitOp{Seq: c.Seq, Writes: cloneWrites(filterWrites(c.Writes, match))}
 		if len(op.Writes) > 0 {
 			backlog = append(backlog, op)
 		}
@@ -172,7 +172,7 @@ func (s *Session) Watch(after Seq, match func(StorageWrite) bool, fn func(Commit
 func (s *Session) publishLocked(op CommitOp) {
 	for i := 0; i < len(s.watchers); i++ {
 		w := s.watchers[i]
-		filtered := CommitOp{Seq: op.Seq, Writes: filterWrites(op.Writes, w.match)}
+		filtered := CommitOp{Seq: op.Seq, Writes: cloneWrites(filterWrites(op.Writes, w.match))}
 		if len(filtered.Writes) == 0 {
 			continue
 		}
